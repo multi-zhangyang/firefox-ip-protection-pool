@@ -1,0 +1,20 @@
+[Unit]
+Description=Firefox IP Protection public proxy pool
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=20
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/firefox-ip-protection-pool
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/firefox-ip-protection-pool/run_service.sh
+Restart=always
+RestartSec=3
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

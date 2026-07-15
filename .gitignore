@@ -1,0 +1,29 @@
+# secrets / runtime
+tokens/*
+!tokens/.gitkeep
+!tokens/*.example.txt
+!tokens/*.example.json
+data/*
+!data/.gitkeep
+export/*
+!export/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# local overrides / private artifacts
+*.env
+*.bak
+*.jwt
+*session*
+*cookie*
+*storage*.json
+AUTH_STATUS.md
+ipp_pool.py.bak
+login_screenshots/
