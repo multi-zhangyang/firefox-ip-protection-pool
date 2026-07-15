@@ -5,7 +5,7 @@ Uses a stored FxA sessionToken (tokens/session_token.txt + account_meta.json)
 to mint a fresh OAuth access token, then Guardian ProxyPass JWT.
 
 Cron:
-  */4 * * * * cd /root/re-workspace/firefox-ip-protection-pool && .venv/bin/python refresh_tokens.py >> logs/refresh.log 2>&1
+  */4 * * * * cd /path/to/firefox-ip-protection-pool && .venv/bin/python refresh_tokens.py >> logs/refresh.log 2>&1
 """
 
 from __future__ import annotations
