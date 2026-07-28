@@ -1,34 +1,85 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
-PY="${PWD}/.venv/bin/python"
-if [[ ! -x "$PY" ]]; then
-  PY=python3
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [[ -n "${IPP_PYTHON:-}" ]]; then
+  PYTHON_BIN="$IPP_PYTHON"
+elif [[ -x "$SCRIPT_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
+else
+  PYTHON_BIN="python3"
 fi
-AUTH_FILE=tokens/proxy_listen_auth.txt
+
+if [[ "$PYTHON_BIN" == */* ]]; then
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "Python executable is not available: $PYTHON_BIN" >&2
+    exit 1
+  fi
+elif ! command -v -- "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "Python executable is not available: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+BIND="${IPP_BIND:-127.0.0.1}"
+ADVERTISE_HOST="${IPP_ADVERTISE_HOST:-$BIND}"
+COUNTRIES="${IPP_COUNTRIES:-}"
+LIMIT="${IPP_LIMIT:-}"
+ROTATE_MODE="${IPP_ROTATE_MODE:-random}"
+REFRESH_BEFORE_START="${IPP_REFRESH_BEFORE_START:-1}"
+
+case "$ROTATE_MODE" in
+  random|rr) ;;
+  *)
+    echo "IPP_ROTATE_MODE must be 'random' or 'rr'" >&2
+    exit 2
+    ;;
+esac
+
+case "$REFRESH_BEFORE_START" in
+  0|1) ;;
+  *)
+    echo "IPP_REFRESH_BEFORE_START must be '0' or '1'" >&2
+    exit 2
+    ;;
+esac
+
+if [[ -n "$LIMIT" && ( ! "$LIMIT" =~ ^[0-9]+$ || "$LIMIT" == 0 ) ]]; then
+  echo "IPP_LIMIT must be a positive integer or empty" >&2
+  exit 2
+fi
+
+listen_host="$BIND"
+if [[ "$listen_host" == *:* && "$listen_host" != \[*\] ]]; then
+  listen_host="[$listen_host]"
+fi
+ROTATOR="${IPP_ROTATOR:-$listen_host:1090}"
+HTTP_ROTATOR="${IPP_HTTP_ROTATOR:-$listen_host:8080}"
+
 mkdir -p logs tokens data export
 
-PUBLIC_IP=$(curl -4 -sS --max-time 8 https://ifconfig.me || curl -4 -sS --max-time 8 https://api.ipify.org || hostname -I | awk '{print $1}')
-if [[ ! -f "$AUTH_FILE" ]]; then
-  echo "missing $AUTH_FILE (copy tokens/proxy_listen_auth.example.txt)" >&2
-  exit 1
-fi
-AUTH_USER=$(awk -F= '/^USER=/{print $2}' "$AUTH_FILE" | tr -d '\r')
-AUTH_PASS=$(awk -F= '/^PASS=/{print $2}' "$AUTH_FILE" | tr -d '\r')
-if [[ -z "${AUTH_USER}" || -z "${AUTH_PASS}" ]]; then
-  echo "missing listen auth in $AUTH_FILE" >&2
-  exit 1
+if [[ "$REFRESH_BEFORE_START" == 1 ]]; then
+  # Refresh is best effort because the pool can reuse a still-valid last-known token.
+  "$PYTHON_BIN" refresh_tokens.py >>logs/refresh.log 2>&1 || true
 fi
 
-$PY refresh_tokens.py >> logs/refresh.log 2>&1 || true
+cmd=(
+  "$PYTHON_BIN" ipp_pool.py run
+  --bind "$BIND"
+  --advertise-host "$ADVERTISE_HOST"
+  --rotator "$ROTATOR"
+  --http-rotator "$HTTP_ROTATOR"
+  --rotate-mode "$ROTATE_MODE"
+)
 
-exec $PY ipp_pool.py run \
-  --bind 0.0.0.0 \
-  --advertise-host "$PUBLIC_IP" \
-  --require-auth \
-  --auth-user "$AUTH_USER" \
-  --auth-pass "$AUTH_PASS" \
-  --limit 15 \
-  --countries US,JP,DE,SG,GB,FR,NL,CA,AU,SE,IE,IT,ES,BE,DK \
-  --rotator 0.0.0.0:1090 \
-  --http-rotator 0.0.0.0:8080
+if [[ -n "$COUNTRIES" ]]; then
+  cmd+=(--countries "$COUNTRIES")
+fi
+if [[ -n "$LIMIT" ]]; then
+  cmd+=(--limit "$LIMIT")
+fi
+
+# Listen credentials are read by ipp_pool.py from its auth file or environment,
+# so passwords never need to be copied into process arguments here.
+exec "${cmd[@]}"

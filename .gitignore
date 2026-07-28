@@ -16,14 +16,39 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 
 # local overrides / private artifacts
 *.env
+.env.*
+!.env.example
+!.env.*.example
 *.bak
 *.jwt
+*.pem
+*.key
 *session*
 *cookie*
 *storage*.json
+credentials*.json
+secrets*
 AUTH_STATUS.md
 ipp_pool.py.bak
 login_screenshots/
+screenshots/
+browser-profile*/
+browser_profiles/
+*.har
+
+# local reports and documentation renderer state
+2026-07-18_proxy-firefox-ipp-us-endpoint-report.md
+docs/.puppeteer-rootless.json
+
+# local reverse-engineering workspace scaffolding
+deobf/
+frida/
+har/
+hooks/
+notes/
+raw/
+replay/

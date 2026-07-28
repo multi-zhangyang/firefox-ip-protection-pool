@@ -27,14 +27,24 @@ import os
 import re
 import string
 import sys
+import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 from fxa.core import Session as FxSession, StretchedPassword
 from fxa.oauth import Client as OAuthClient
 from fxa._utils import APIClient
 from playwright.sync_api import sync_playwright
+
+from refresh_tokens import (
+    ProxyPassValidationError,
+    _retry_after_seconds,
+    atomic_write_text,
+    guardian_request,
+    validate_proxy_pass_jwt,
+)
 
 ROOT = Path(__file__).resolve().parent
 TOKENS = ROOT / "tokens"
@@ -48,6 +58,36 @@ VPN_CLIENT_ID = "e6eb0d1e856335fc"
 SCOPES = "profile https://identity.mozilla.com/apps/vpn"
 GUARDIAN = "https://vpn.mozilla.org"
 ALPH = string.ascii_letters + string.digits
+
+
+def atomic_write_bytes(path: Path, content: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as tmp:
+            fd = -1
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def safe_page_location(url: str) -> str:
+    parsed = urlsplit(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+
+def save_storage_state(context, path: Path) -> None:
+    atomic_write_text(path, json.dumps(context.storage_state(), separators=(",", ":")) + "\n")
 
 
 def solve_pow(base: str, target: str) -> str:
@@ -142,7 +182,7 @@ def pass_fastly_and_login(page, email: str, password: str) -> None:
         if captcha:
             raw = base64.b64decode(captcha.split(",", 1)[1])
             guess = vision_captcha(raw)
-            print("[*] captcha:", guess)
+            print("[*] captcha answer obtained")
             answers.append({"ty": "captcha", "answer": guess})
         url = f"https://accounts.firefox.com{state['prefix']}/fst-post-back"
         r = page.request.post(
@@ -164,8 +204,8 @@ def pass_fastly_and_login(page, email: str, password: str) -> None:
     page.locator('input[type="password"]').first.fill(password)
     page.locator('button[type="submit"]').first.click()
     page.wait_for_timeout(6000)
-    page.screenshot(path=str(LOGS / "bootstrap_after_password.png"), full_page=True)
-    print("[*] after password:", page.url)
+    atomic_write_bytes(LOGS / "bootstrap_after_password.png", page.screenshot(full_page=True))
+    print("[*] after password:", safe_page_location(page.url))
 
 
 def submit_email_code(page, code: str) -> None:
@@ -200,9 +240,8 @@ def submit_email_code(page, code: str) -> None:
             page.click(sel)
             break
     page.wait_for_timeout(8000)
-    page.screenshot(path=str(LOGS / "bootstrap_after_code.png"), full_page=True)
-    print("[*] after code:", page.url)
-    print(page.inner_text("body")[:500])
+    atomic_write_bytes(LOGS / "bootstrap_after_code.png", page.screenshot(full_page=True))
+    print("[*] after code:", safe_page_location(page.url))
 
 
 def api_login_with_page(page, email: str, password: str) -> dict:
@@ -211,13 +250,16 @@ def api_login_with_page(page, email: str, password: str) -> dict:
         data=json.dumps({"email": email}),
         headers={"content-type": "application/json", "accept": "application/json"},
     )
-    print("[*] credentials/status", cr.status, cr.text()[:200])
+    print("[*] credentials/status", cr.status)
     salt = None
     if cr.status == 200:
-        salt = cr.json().get("clientSalt")
+        try:
+            status_data = cr.json()
+        except Exception as exc:
+            raise RuntimeError("credentials/status returned invalid JSON") from exc
+        salt = status_data.get("clientSalt") if isinstance(status_data, dict) else None
     if not salt:
-        # fallback known salt from earlier probe if any
-        salt = "identity.mozilla.com/picl/v1/quickStretchV2:937e93ab0bf3781ff7a0f8c07e8a29b9"
+        raise RuntimeError("credentials/status did not return a clientSalt; refusing stale fallback")
     sp = StretchedPassword(2, email, salt, password, None)
     lr = page.request.post(
         "https://api.accounts.firefox.com/v1/account/login",
@@ -229,20 +271,26 @@ def api_login_with_page(page, email: str, password: str) -> dict:
             "referer": "https://accounts.firefox.com/",
         },
     )
-    print("[*] account/login", lr.status, lr.text()[:300])
+    print("[*] account/login", lr.status)
     if lr.status != 200:
         # maybe already logged in via UI and session cookies exist; still need sessionToken
-        raise RuntimeError(f"account/login failed: {lr.status} {lr.text()[:200]}")
+        raise RuntimeError(f"account/login failed: HTTP {lr.status}")
     data = lr.json()
-    (TOKENS / "session.json").write_text(json.dumps(data, indent=2))
+    if not isinstance(data, dict):
+        raise RuntimeError("account/login returned an invalid response")
+    data.setdefault("email", email)
     return data
 
 
 def oauth_and_proxy_pass(session_json: dict) -> None:
-    session_token = session_json["sessionToken"]
+    session_token = session_json.get("sessionToken") or ""
     email = session_json.get("email") or ""
+    uid = session_json.get("uid") or ""
+    if not email or not uid or not session_token:
+        raise RuntimeError("account/login response is missing email, uid, or sessionToken")
     server = "https://api.accounts.firefox.com/v1"
     apiclient = APIClient(server)
+    sp = StretchedPassword(1, email, None, "x", None)
 
     class DummyClient:
         def __init__(self):
@@ -252,8 +300,9 @@ def oauth_and_proxy_pass(session_json: dict) -> None:
     session = FxSession(
         DummyClient(),
         email,
+        sp.v1,
+        uid,
         session_token,
-        uid=session_json.get("uid"),
         verified=session_json.get("verified", True),
         auth_timestamp=int(time.time() * 1000),
     )
@@ -263,35 +312,68 @@ def oauth_and_proxy_pass(session_json: dict) -> None:
         try:
             oauth = OAuthClient(client_id=client_id, server_url="https://oauth.accounts.firefox.com/v1")
             access = oauth.authorize_token(session, scope=SCOPES, client_id=client_id)
-            print(f"[+] oauth access via {client_id}, len={len(access)}")
+            print(f"[+] oauth access granted via client {client_id}")
             break
         except Exception as e:
             last_err = e
-            print(f"[!] oauth {client_id} failed: {e}")
+            print(f"[!] oauth {client_id} failed ({type(e).__name__})")
     if not access:
-        raise RuntimeError(f"oauth failed: {last_err}")
-    (TOKENS / "fxa_token.txt").write_text(access + "\n")
+        kind = type(last_err).__name__ if last_err is not None else "unknown error"
+        raise RuntimeError(f"oauth failed ({kind})")
 
     # try refresh token if authorize_code path exposes it - PyFxA authorize_token may not
     # Guardian
     headers = {
         "Authorization": f"Bearer {access}",
         "Accept": "application/json",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
         "User-Agent": "firefox-ip-protection-pool/1.0",
     }
-    st = requests.get(f"{GUARDIAN}/api/v1/fpn/status", headers=headers, timeout=30)
-    print("[*] fpn/status", st.status_code, st.text[:300])
+    st = guardian_request("GET", "/api/v1/fpn/status", headers=headers, label="fpn/status")
+    print("[*] fpn/status", f"HTTP {st.status_code}")
+    if st.status_code == 429 or 500 <= st.status_code <= 599:
+        retry_after = _retry_after_seconds(st.headers.get("Retry-After"))
+        suffix = f"; retry after {retry_after:g}s" if st.status_code == 429 and retry_after is not None else ""
+        raise RuntimeError(f"fpn/status failed: HTTP {st.status_code}{suffix}")
     if st.status_code in (401, 403, 404):
-        ar = requests.post(f"{GUARDIAN}/api/v1/fpn/activate", headers=headers, timeout=30)
-        print("[*] fpn/activate", ar.status_code, ar.text[:300])
-    tr = requests.get(f"{GUARDIAN}/api/v1/fpn/token", headers=headers, timeout=30)
-    print("[*] fpn/token", tr.status_code, tr.text[:300])
+        ar = guardian_request("POST", "/api/v1/fpn/activate", headers=headers, label="fpn/activate")
+        print("[*] fpn/activate", f"HTTP {ar.status_code}")
+        if not ar.ok:
+            retry_after = _retry_after_seconds(ar.headers.get("Retry-After"))
+            suffix = f"; retry after {retry_after:g}s" if ar.status_code == 429 and retry_after is not None else ""
+            raise RuntimeError(f"fpn/activate failed: HTTP {ar.status_code}{suffix}")
+    tr = guardian_request("GET", "/api/v1/fpn/token", headers=headers, label="fpn/token")
+    print("[*] fpn/token", f"HTTP {tr.status_code}")
     if not tr.ok:
-        raise RuntimeError(f"proxy pass failed: {tr.status_code} {tr.text[:200]}")
-    tok = tr.json().get("token")
-    if not tok:
-        raise RuntimeError("no token in fpn response")
-    (TOKENS / "proxy_pass.jwt").write_text(tok + "\n")
+        retry_after = _retry_after_seconds(tr.headers.get("Retry-After"))
+        suffix = f"; retry after {retry_after:g}s" if tr.status_code == 429 and retry_after is not None else ""
+        raise RuntimeError(f"proxy pass failed: HTTP {tr.status_code}{suffix}")
+    try:
+        token_response = tr.json()
+    except requests.exceptions.JSONDecodeError as exc:
+        raise RuntimeError("fpn/token returned invalid JSON") from exc
+    tok = token_response.get("token") if isinstance(token_response, dict) else None
+    if not isinstance(tok, str) or not tok:
+        raise RuntimeError("fpn/token response has no token field")
+    try:
+        validate_proxy_pass_jwt(tok)
+    except ProxyPassValidationError as exc:
+        raise RuntimeError(f"rejected ProxyPass JWT: {exc}") from exc
+
+    # Only replace last-good credentials after Guardian returns a valid ProxyPass JWT.
+    atomic_write_text(TOKENS / "fxa_token.txt", access + "\n")
+    atomic_write_text(TOKENS / "proxy_pass.jwt", tok + "\n")
+    atomic_write_text(TOKENS / "session_token.txt", session_token + "\n")
+    atomic_write_text(TOKENS / "session.json", json.dumps(session_json, indent=2) + "\n")
+    account_meta_path = TOKENS / "account_meta.json"
+    try:
+        existing_meta = json.loads(account_meta_path.read_text(encoding="utf-8"))
+        account_meta = existing_meta if isinstance(existing_meta, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        account_meta = {}
+    account_meta.update({"email": email, "uid": uid, "sessionToken": session_token})
+    atomic_write_text(TOKENS / "account_meta.json", json.dumps(account_meta, indent=2) + "\n")
     print("[+] saved tokens/proxy_pass.jwt")
 
 
@@ -340,8 +422,8 @@ def main() -> int:
                     "[!] Mozilla sent a 6-digit email code. Put it in tokens/email_code.txt or pass --code",
                     file=sys.stderr,
                 )
-                print(f"    page={page.url}", file=sys.stderr)
-                context.storage_state(path=str(DATA / "fxa_pending_code.json"))
+                print(f"    page={safe_page_location(page.url)}", file=sys.stderr)
+                save_storage_state(context, DATA / "fxa_pending_code.json")
                 browser.close()
                 return 3
             submit_email_code(page, code)
@@ -350,16 +432,23 @@ def main() -> int:
         try:
             session_json = api_login_with_page(page, args.email, args.password)
         except Exception as e:
-            print("[!] api login after code failed:", e)
+            print(f"[!] api login after code failed ({type(e).__name__})", file=sys.stderr)
             # If UI is logged in, user may still need another path
-            context.storage_state(path=str(DATA / "fxa_after_code.json"))
+            save_storage_state(context, DATA / "fxa_after_code.json")
             browser.close()
             return 4
 
-        context.storage_state(path=str(DATA / "fxa_logged_in.json"))
+        save_storage_state(context, DATA / "fxa_logged_in.json")
         browser.close()
 
-    oauth_and_proxy_pass(session_json)
+    try:
+        oauth_and_proxy_pass(session_json)
+    except RuntimeError as exc:
+        print(f"[!] bootstrap token exchange failed: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"[!] bootstrap token exchange failed ({type(exc).__name__})", file=sys.stderr)
+        return 1
     print("[*] bootstrap complete. Next:")
     print("    python ipp_pool.py token-status")
     print("    python ipp_pool.py probe --country US")
@@ -368,4 +457,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    except Exception as exc:
+        print(f"[!] bootstrap failed ({type(exc).__name__})", file=sys.stderr)
+        exit_code = 1
+    raise SystemExit(exit_code)

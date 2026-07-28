@@ -1,0 +1,14 @@
+flowchart LR
+    user[Firefox account] --> oauth[FxA OAuth]
+    oauth --> guardian[Guardian]
+    guardian --> token[ProxyPass JWT]
+    settings[Remote Settings] --> filter[Version and country filter]
+    filter --> nodes[CONNECT-capable node set]
+    token --> connect[TLS + HTTPS CONNECT]
+    nodes --> connect
+    client[Local SOCKS5 or HTTP client] --> listener[Authenticated local listener]
+    listener --> connect
+    connect --> fastly[Fastly exit]
+    fastly --> target[Destination]
+    token -. refresh on expiry .-> guardian
+    settings -. ETag or 304 cache .-> nodes
