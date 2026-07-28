@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from fxa.errors import ClientError
 
 import refresh_tokens
+import refresh_state
 from refresh_state import load_refresh_state, record_refresh_state
 
 
@@ -222,7 +223,7 @@ class RefreshHelperLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "account_meta.json"):
                 refresh_tokens.load_account()
 
-    def test_oauth_429_is_rate_limited_instead_of_reauth_required(self) -> None:
+    def test_oauth_429_has_its_own_soft_rate_limit_state(self) -> None:
         (self.tokens / "session_token.txt").write_text(
             "synthetic-session-token\n", encoding="utf-8"
         )
@@ -254,7 +255,7 @@ class RefreshHelperLifecycleTests(unittest.TestCase):
         self.assertEqual(exit_code, refresh_tokens.EX_TEMPFAIL)
         guardian_request.assert_not_called()
         state = load_refresh_state(self.state_file)
-        self.assertEqual(state["result"], "rate_limited")
+        self.assertEqual(state["result"], "oauth_rate_limited")
         self.assertEqual(state["http_status"], 429)
         self.assertGreater(state["next_attempt_at"], time.time())
 
@@ -467,7 +468,7 @@ class RefreshHelperLifecycleTests(unittest.TestCase):
 
     def test_lock_conflict_returns_tempfail_without_network(self) -> None:
         with (
-            patch.object(refresh_tokens.fcntl, "flock", side_effect=BlockingIOError),
+            patch.object(refresh_state.fcntl, "flock", side_effect=BlockingIOError),
             patch.object(refresh_tokens.requests, "request") as request,
         ):
             exit_code = refresh_tokens.main([])

@@ -39,7 +39,7 @@ import requests
 from fxa.core import Session as FxSession, StretchedPassword
 from fxa.oauth import Client as OAuthClient
 
-from refresh_state import record_refresh_state
+from refresh_state import record_refresh_state, refresh_lock
 from refresh_tokens import (
     ProxyPassValidationError,
     ROTATE_BEFORE_SECONDS,
@@ -47,7 +47,6 @@ from refresh_tokens import (
     atomic_write_text,
     bounded_fxa_api_client,
     guardian_request,
-    refresh_lock,
     validate_proxy_pass_jwt,
 )
 

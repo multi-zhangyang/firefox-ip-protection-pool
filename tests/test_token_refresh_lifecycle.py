@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 
 import ipp_pool
 import refresh_tokens
-from refresh_state import record_refresh_state
+from refresh_state import record_refresh_state, refresh_lock
 
 
 def _segment(value: dict[str, object]) -> str:
@@ -400,6 +400,26 @@ class TokenRefreshLifecycleTests(unittest.TestCase):
 
         run.assert_not_called()
 
+    def test_oauth_rate_limit_keeps_a_usable_last_good_available(self) -> None:
+        last_good = _token(time.time() + 60)
+        store = self.store(proxy_pass=last_good)
+        record_refresh_state(
+            self.token_dir / "refresh_state.json",
+            "oauth_rate_limited",
+            http_status=429,
+            next_attempt_at=time.time() + 300,
+        )
+
+        with patch.object(ipp_pool.subprocess, "run") as run:
+            self.assertEqual(store.ensure(), last_good)
+            self.assertFalse(store.should_refresh())
+
+        run.assert_not_called()
+        self.assertEqual(
+            store.status()["refresh_state"]["result"],
+            "oauth_rate_limited",
+        )
+
     def test_expired_rate_limit_forces_revalidation_even_when_pass_is_fresh(self) -> None:
         current = _token(time.time() + 600, "current")
         replacement = _token(time.time() + 900, "replacement")
@@ -543,6 +563,57 @@ class TokenRefreshLifecycleTests(unittest.TestCase):
         retry_at = store.status()["retry_at"]
         self.assertGreaterEqual(retry_at, before + 4.5)
         self.assertLessEqual(retry_at, time.time() + 5.5)
+
+    def test_direct_refresh_never_writes_while_shared_refresh_lock_is_held(self) -> None:
+        store = self.store(fxa_token="synthetic-fxa-access")
+
+        with (
+            refresh_lock(self.token_dir, blocking=True),
+            patch.object(ipp_pool.urllib.request, "urlopen") as urlopen,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "refresh is in progress"):
+                store.refresh()
+
+        urlopen.assert_not_called()
+        self.assertEqual(store.status()["refresh_state"]["result"], "never")
+
+    def test_missing_credentials_never_overwrite_shared_lock_owner(self) -> None:
+        store = self.store()
+
+        with (
+            refresh_lock(self.token_dir, blocking=True),
+            patch.object(ipp_pool.urllib.request, "urlopen") as urlopen,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "refresh is in progress"):
+                store.refresh()
+
+        urlopen.assert_not_called()
+        self.assertEqual(store.status()["refresh_state"]["result"], "never")
+
+    def test_direct_refresh_adopts_a_pass_published_before_lock_acquisition(self) -> None:
+        original = _token(time.time() + 600, "original")
+        replacement = _token(time.time() + 900, "bootstrap")
+        proxy_file = self.token_dir / "proxy_pass.jwt"
+        proxy_file.write_text(original + "\n", encoding="utf-8")
+        store = self.store(fxa_token="stale-explicit-fxa-access")
+
+        class PublishBeforeLock:
+            def __enter__(inner_self):
+                temporary = self.token_dir / ".bootstrap-proxy"
+                temporary.write_text(replacement + "\n", encoding="utf-8")
+                os.replace(temporary, proxy_file)
+                return inner_self
+
+            def __exit__(inner_self, *_args):
+                return False
+
+        with (
+            patch.object(ipp_pool, "refresh_lock", return_value=PublishBeforeLock()),
+            patch.object(ipp_pool.urllib.request, "urlopen") as urlopen,
+        ):
+            self.assertEqual(store.refresh(force=True), replacement)
+
+        urlopen.assert_not_called()
 
     def test_pool_stop_wakes_and_joins_named_refresh_worker(self) -> None:
         tokens = Mock()

@@ -133,7 +133,7 @@ python3 -m venv .venv
 
 只有 `--force` 成功后才能说明本地 session 确实可用于自动续期。`token-status` 中应看到 `automatic_renewal_ready: true`、`proxy_pass.valid: true`，并且 `refresh_state.result` 为 `success` 或后续的 `fresh`。`tokens/refresh_state.json` 只保存最近成功时间、失败分类、到期时间和下次允许重试时间，不保存任何 token 或账号标识。
 
-常驻进程会在 ProxyPass 到期前 120 秒进入主动轮换，默认每 30 秒检查一次。刷新期间其他请求仍可使用尚未真正到期的 last-good token；并发请求和独立进程只共享一轮刷新。网络和 5xx 失败采用有界重试及持久化指数退避，Guardian 429 优先遵守 `Retry-After`，其次遵守配额重置时间。配额耗尽、OAuth 重新认证或账号资格被拒时会暂停新隧道，而不是高频请求或绕过限制；交互重新登录发布新凭据时会等待旧刷新结束，并在同一跨进程锁内清除旧会话留下的暂停状态。
+常驻进程会在 ProxyPass 到期前 120 秒进入主动轮换，默认每 30 秒检查一次。刷新期间其他请求仍可使用尚未真正到期的 last-good token；并发请求和独立进程只共享一轮刷新。网络和 5xx 失败采用有界重试及持久化指数退避。Guardian token 端点的 429 表示代理配额限制，会优先遵守 `Retry-After`，其次遵守配额重置时间并暂停新隧道；FxA OAuth 端点的 429 只表示暂时无法签发 OAuth token，会退避但不会误停仍有效的 last-good。OAuth 重新认证或账号资格被拒时会暂停新隧道，而不是高频请求或绕过限制；交互重新登录发布新凭据时会等待旧刷新结束，并在同一跨进程锁内清除旧会话留下的暂停状态。
 
 `run_service.sh` 会在每次启动前通过同一续期状态机检查一次：健康且充足的缓存不会额外联网，已到期的限流或认证暂停则必须真实联网重验。运行中的后台 worker 才是持续续期的主机制。只要服务常驻，就不需要另装 cron，也不需要定期执行 `token-refresh` 或手工替换 JWT。
 

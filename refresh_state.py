@@ -14,8 +14,9 @@ import os
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 try:
     import fcntl
@@ -32,6 +33,7 @@ RESULTS = {
     "busy",
     "backoff",
     "rate_limited",
+    "oauth_rate_limited",
     "reauth_required",
     "no_entitlement",
     "missing_credentials",
@@ -40,6 +42,7 @@ RESULTS = {
 }
 FAILURE_RESULTS = {
     "rate_limited",
+    "oauth_rate_limited",
     "reauth_required",
     "no_entitlement",
     "missing_credentials",
@@ -47,6 +50,29 @@ FAILURE_RESULTS = {
     "protocol_error",
 }
 _PROCESS_STATE_LOCK = threading.RLock()
+
+
+@contextmanager
+def refresh_lock(token_dir: Path, *, blocking: bool) -> Iterator[None]:
+    """Serialize every ProxyPass writer and credential publisher."""
+    if fcntl is None:  # pragma: no cover - Linux is the supported service target.
+        raise RuntimeError("automatic renewal requires fcntl file locking")
+    token_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = token_dir / ".refresh.lock"
+    lock_handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        os.chmod(lock_path, 0o600)
+        operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        fcntl.flock(lock_handle.fileno(), operation)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_handle.close()
 
 
 def empty_refresh_state() -> dict[str, Any]:

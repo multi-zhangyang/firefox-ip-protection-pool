@@ -12,9 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-from contextlib import contextmanager
 import email.utils
-import fcntl
 import json
 import math
 import os
@@ -23,7 +21,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from urllib.parse import urlsplit
 
 import requests
@@ -31,7 +29,7 @@ from fxa.core import Session as FxSession, StretchedPassword
 from fxa.oauth import Client as OAuthClient
 from fxa._utils import APIClient
 
-from refresh_state import load_refresh_state, record_refresh_state, retry_delay
+from refresh_state import load_refresh_state, record_refresh_state, refresh_lock, retry_delay
 
 ROOT = Path(__file__).resolve().parent
 TOKENS = ROOT / "tokens"
@@ -76,33 +74,6 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
         except FileNotFoundError:
             pass
         raise
-
-
-@contextmanager
-def refresh_lock(token_dir: Path, *, blocking: bool) -> Iterator[None]:
-    """Serialize refresh and credential publication across processes.
-
-    A bootstrap only holds this lock while publishing already-obtained
-    credentials.  This lets an in-flight helper finish before the new session
-    and its success state become visible, preventing a stale 401 from
-    overwriting a freshly bootstrapped session.
-    """
-    token_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = token_dir / ".refresh.lock"
-    lock_handle = open(lock_path, "a+", encoding="utf-8")
-    try:
-        os.chmod(lock_path, 0o600)
-        operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
-        fcntl.flock(lock_handle.fileno(), operation)
-        try:
-            yield
-        finally:
-            try:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-    finally:
-        lock_handle.close()
 
 
 def bounded_fxa_api_client(server_url: str) -> APIClient:
@@ -387,7 +358,7 @@ def _record_failure(
         f"refresh result={result}{status_text}; retry in {int(math.ceil(delay))}s",
         file=sys.stderr,
     )
-    return EX_TEMPFAIL if result in {"rate_limited", "transient_error"} else 1
+    return EX_TEMPFAIL if result in {"rate_limited", "oauth_rate_limited", "transient_error"} else 1
 
 
 def _refresh_once(*, force: bool) -> int:
@@ -484,7 +455,10 @@ def _refresh_once(*, force: bool) -> int:
         except Exception as exc:
             status = _exception_status(exc)
             if status == 429:
-                result = "rate_limited"
+                # FxA OAuth throttling does not prove that Guardian proxy
+                # traffic quota is exhausted.  Keep its cooldown, but do not
+                # hard-pause a still-usable last-good ProxyPass.
+                result = "oauth_rate_limited"
             elif status is not None and 400 <= status <= 499:
                 result = "reauth_required"
             else:

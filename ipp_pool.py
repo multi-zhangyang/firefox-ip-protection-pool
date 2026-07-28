@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import quote, urlsplit
 
-from refresh_state import load_refresh_state, record_refresh_state, retry_delay
+from refresh_state import load_refresh_state, record_refresh_state, refresh_lock, retry_delay
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -788,6 +788,13 @@ class TokenStore:
         if renewal_block is not None:
             _, next_attempt = renewal_block
             return next_attempt is None or next_attempt <= time.time()
+        next_attempt = self.refresh_state.get("next_attempt_at")
+        if (
+            isinstance(next_attempt, (int, float))
+            and not isinstance(next_attempt, bool)
+            and next_attempt > time.time()
+        ):
+            return False
         if not self._proxy_pass or self._is_rejected_unlocked(self._proxy_pass):
             return True
         try:
@@ -1111,6 +1118,81 @@ class TokenStore:
                 return None
         return None
 
+    def _refresh_direct_serialized(
+        self,
+        fxa_token: str,
+        observed_marker: tuple[int, int, int] | None,
+    ) -> str | None:
+        """Run the legacy direct writer under the shared publication lock."""
+        try:
+            with refresh_lock(self._proxy_file.parent, blocking=False):
+                # A helper or bootstrap may have completed between the first
+                # in-process check and lock acquisition.  Adopt its atomically
+                # published pass instead of overwriting it with an older
+                # explicit FxA access token.
+                self._sync_refresh_state()
+                with self._lock:
+                    self._reload_from_disk()
+                    if (
+                        self._proxy_marker != observed_marker
+                        and self._usable_unlocked()
+                    ):
+                        return self._proxy_pass or ""
+                    next_attempt = (
+                        self.refresh_state.get("next_attempt_at") or self.retry_at
+                    )
+                    now = time.time()
+                    if isinstance(next_attempt, (int, float)) and next_attempt > now:
+                        wait = max(1, int(next_attempt - now))
+                        self.last_error = (
+                            f"Guardian refresh is in backoff; retry in {wait}s"
+                        )
+                        return None
+                self._record_state("in_progress", next_attempt_at=None)
+                return self._refresh_direct(fxa_token)
+        except BlockingIOError:
+            # Never publish a competing busy result: the lock owner will write
+            # the authoritative ProxyPass and cooldown state.
+            self._sync_refresh_state()
+            with self._lock:
+                self.last_error = "another token refresh is in progress"
+                if not isinstance(self.retry_at, (int, float)) or self.retry_at <= time.time():
+                    self.retry_at = time.time() + 5
+            return None
+
+    def _record_missing_credentials_serialized(
+        self,
+        observed_marker: tuple[int, int, int] | None,
+    ) -> str | None:
+        """Publish missing-credential state without racing a bootstrap."""
+        try:
+            with refresh_lock(self._proxy_file.parent, blocking=False):
+                self._sync_refresh_state()
+                with self._lock:
+                    self._reload_from_disk()
+                    if (
+                        self._proxy_marker != observed_marker
+                        and self._usable_unlocked()
+                    ):
+                        return self._proxy_pass or ""
+                if self._session_refresh_available():
+                    with self._lock:
+                        self.last_error = "renewal credentials changed; retry refresh"
+                    return None
+                self._record_failure(
+                    "missing_credentials",
+                    "missing FxA token / session",
+                    delay=60,
+                )
+                return None
+        except BlockingIOError:
+            self._sync_refresh_state()
+            with self._lock:
+                self.last_error = "another token refresh is in progress"
+                if not isinstance(self.retry_at, (int, float)) or self.retry_at <= time.time():
+                    self.retry_at = time.time() + 5
+            return None
+
     def refresh(
         self,
         force: bool = False,
@@ -1120,6 +1202,7 @@ class TokenStore:
         with self._lock:
             self._reload_from_disk()
             observed = self._proxy_pass
+            observed_marker = self._proxy_marker
             if rejected:
                 self._mark_rejected_unlocked(rejected)
         with self._refresh_lock:
@@ -1127,7 +1210,7 @@ class TokenStore:
             # cooldown after this TokenStore was created.  Refresh the
             # non-secret state before making any network decision so a
             # restart or cross-process race cannot erase Retry-After.
-            persisted_state = self._sync_refresh_state()
+            self._sync_refresh_state()
             with self._lock:
                 self._reload_from_disk()
                 if rejected:
@@ -1142,6 +1225,7 @@ class TokenStore:
                 elif (
                     not force
                     and self._renewal_block_unlocked() is None
+                    and self._usable_unlocked()
                     and not self.should_refresh_unlocked()
                 ):
                     return self._proxy_pass or ""
@@ -1162,23 +1246,21 @@ class TokenStore:
                 )
 
             session_refresh = self._session_refresh_available()
-            # The helper owns the cross-process lock and records its own
-            # in-progress state.  Writing that state here could race a helper
-            # that has just persisted a cooldown and accidentally clear it.
-            if not session_refresh:
-                self._record_state("in_progress", next_attempt_at=None)
+            # Each writer owns the cross-process lock and records its own
+            # in-progress state.  Writing it here could race a lock owner that
+            # has just persisted a longer cooldown and clear it accidentally.
             try:
                 if session_refresh:
                     token = self._refresh_via_helper(force=force_helper)
                 elif fxa_token:
-                    token = self._refresh_direct(fxa_token)
-                else:
-                    self._record_failure(
-                        "missing_credentials",
-                        "missing FxA token / session",
-                        delay=60,
+                    token = self._refresh_direct_serialized(
+                        fxa_token,
+                        observed_marker,
                     )
-                    token = None
+                else:
+                    token = self._record_missing_credentials_serialized(
+                        observed_marker,
+                    )
             except Exception as exc:
                 self._record_failure(
                     "transient_error",
