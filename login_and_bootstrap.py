@@ -39,12 +39,12 @@ import requests
 from fxa.core import Session as FxSession, StretchedPassword
 from fxa.oauth import Client as OAuthClient
 
+from renewal_credentials import atomic_write_text, write_renewal_credentials
 from refresh_state import record_refresh_state, refresh_lock
 from refresh_tokens import (
     ProxyPassValidationError,
     ROTATE_BEFORE_SECONDS,
     _retry_after_seconds,
-    atomic_write_text,
     bounded_fxa_api_client,
     guardian_request,
     validate_proxy_pass_jwt,
@@ -355,14 +355,16 @@ def persist_bootstrap_credentials(
     """Publish a new renewable session without racing the refresh helper."""
     # Wait only at publication time.  The interactive browser flow does not
     # hold the lock, but any old helper must finish before this new session and
-    # success state become visible.  Later helpers see all files atomically
-    # replaced while protected by the same cross-process lock.
+    # success state become visible.  The renewal credential record is one
+    # atomic file; ProxyPass and refresh state are then published in order
+    # while the same cross-process lock excludes every other writer.
     destination = TOKENS if token_dir is None else token_dir
     with refresh_lock(destination, blocking=True):
-        atomic_write_text(destination / "session_token.txt", session_token + "\n")
-        atomic_write_text(
-            destination / "account_meta.json",
-            json.dumps({"email": email, "uid": uid}, indent=2) + "\n",
+        write_renewal_credentials(
+            destination,
+            email=email,
+            uid=uid,
+            session_token=session_token,
         )
         atomic_write_text(destination / "proxy_pass.jwt", proxy_pass + "\n")
         # A successful interactive login supersedes proxy authorization
@@ -379,6 +381,11 @@ def persist_bootstrap_credentials(
             http_status=http_status,
             proxy_pass_expires_at=expires_at,
         )
+        for legacy_name in ("session_token.txt", "account_meta.json"):
+            try:
+                (destination / legacy_name).unlink()
+            except FileNotFoundError:
+                pass
 
 
 def oauth_and_proxy_pass(session_json: dict) -> None:

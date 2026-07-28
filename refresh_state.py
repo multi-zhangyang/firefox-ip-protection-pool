@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - Linux is the recommended service platf
 SCHEMA_VERSION = 1
 RESULTS = {
     "never",
+    "credentials_imported",
     "in_progress",
     "fresh",
     "success",
@@ -206,6 +207,8 @@ def record_refresh_state(
                 state["last_success_at"] = current
                 state["consecutive_failures"] = 0
                 state["generation"] = int(state["generation"]) + 1
+            elif result == "credentials_imported":
+                state["consecutive_failures"] = 0
             elif result == "fresh":
                 state["consecutive_failures"] = 0
             elif result in FAILURE_RESULTS:

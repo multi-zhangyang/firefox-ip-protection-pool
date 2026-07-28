@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 import ipp_pool
 import refresh_tokens
+from renewal_credentials import write_renewal_credentials
 from refresh_state import record_refresh_state, refresh_lock
 
 
@@ -399,6 +400,76 @@ class TokenRefreshLifecycleTests(unittest.TestCase):
                 store.ensure()
 
         run.assert_not_called()
+
+    def test_imported_credentials_block_old_pass_until_verification_succeeds(self) -> None:
+        old_token = _token(time.time() + 600, "old-session")
+        (self.token_dir / "proxy_pass.jwt").write_text(
+            old_token + "\n", encoding="utf-8"
+        )
+        write_renewal_credentials(
+            self.token_dir,
+            email="desktop@example.invalid",
+            uid="a" * 32,
+            session_token="b" * 64,
+        )
+        record_refresh_state(
+            self.token_dir / "refresh_state.json",
+            "credentials_imported",
+        )
+        store = self.store()
+
+        with patch.object(
+            ipp_pool.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=1),
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "credentials_imported"):
+                store.ensure()
+
+        command = run.call_args.args[0]
+        self.assertIn("--force", command)
+        self.assertEqual(store.current(), old_token)
+        self.assertEqual(
+            store.status()["refresh_state"]["result"],
+            "credentials_imported",
+        )
+
+    def test_imported_credentials_unblock_only_after_verified_helper_success(self) -> None:
+        old_token = _token(time.time() + 600, "old-session")
+        replacement = _token(time.time() + 900, "new-session")
+        (self.token_dir / "proxy_pass.jwt").write_text(
+            old_token + "\n", encoding="utf-8"
+        )
+        write_renewal_credentials(
+            self.token_dir,
+            email="desktop@example.invalid",
+            uid="a" * 32,
+            session_token="b" * 64,
+        )
+        record_refresh_state(
+            self.token_dir / "refresh_state.json",
+            "credentials_imported",
+        )
+        store = self.store()
+
+        def helper(command, **_kwargs):
+            self.assertIn("--force", command)
+            (self.token_dir / "proxy_pass.jwt").write_text(
+                replacement + "\n", encoding="utf-8"
+            )
+            record_refresh_state(
+                self.token_dir / "refresh_state.json",
+                "success",
+                http_status=200,
+                proxy_pass_expires_at=time.time() + 900,
+            )
+            return SimpleNamespace(returncode=0)
+
+        with patch.object(ipp_pool.subprocess, "run", side_effect=helper) as run:
+            self.assertEqual(store.ensure(), replacement)
+
+        run.assert_called_once()
+        self.assertEqual(store.status()["refresh_state"]["result"], "success")
 
     def test_oauth_rate_limit_keeps_a_usable_last_good_available(self) -> None:
         last_good = _token(time.time() + 60)

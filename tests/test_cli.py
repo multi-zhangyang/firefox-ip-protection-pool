@@ -79,6 +79,21 @@ class RunCliValidationTests(unittest.TestCase):
                 self.assert_invalid_before_io("--limit", value)
 
 
+class CredentialGuideTests(unittest.TestCase):
+    def test_guide_uses_desktop_firefox_export_instead_of_vps_playwright(self) -> None:
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            self.assertEqual(ipp_pool.main(["how-to-token"]), 0)
+
+        guide = output.getvalue()
+        self.assertIn("tools/firefox-credential-export.html", guide)
+        self.assertIn("import_credentials.py", guide)
+        self.assertIn("Windows", guide)
+        self.assertIn("macOS", guide)
+        self.assertNotIn("Playwright", guide)
+
+
 class ProbeDefaultSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.nodes = [

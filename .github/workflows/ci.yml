@@ -42,7 +42,7 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: 检查 Python 语法
-        run: python -m py_compile ipp_pool.py refresh_tokens.py refresh_state.py login_and_bootstrap.py
+        run: python -m py_compile ipp_pool.py refresh_tokens.py refresh_state.py renewal_credentials.py login_and_bootstrap.py import_credentials.py
 
       - name: 检查 Shell 语法
         run: bash -n run_service.sh start_pool.sh

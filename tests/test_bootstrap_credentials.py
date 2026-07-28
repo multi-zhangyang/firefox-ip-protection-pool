@@ -14,6 +14,10 @@ import refresh_tokens
 from refresh_state import load_refresh_state
 
 
+UID = "0123456789abcdef0123456789abcdef"
+SESSION_TOKEN = "0123456789abcdef" * 4
+
+
 class BootstrapCredentialPublicationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -27,9 +31,9 @@ class BootstrapCredentialPublicationTests(unittest.TestCase):
 
     def publish(self) -> None:
         login_and_bootstrap.persist_bootstrap_credentials(
-            session_token="new-session-token",
+            session_token=SESSION_TOKEN,
             email="renewal@example.invalid",
-            uid="new-account-uid",
+            uid=UID,
             proxy_pass="new-proxy-pass",
             expires_at=time.time() + 600,
             http_status=200,
@@ -55,27 +59,29 @@ class BootstrapCredentialPublicationTests(unittest.TestCase):
             self.assertTrue(started.wait(1))
             thread.join(0.1)
             self.assertTrue(thread.is_alive())
-            self.assertFalse((self.tokens / "session_token.txt").exists())
+            self.assertFalse((self.tokens / "renewal_credentials.json").exists())
 
         thread.join(2)
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(
-            (self.tokens / "session_token.txt").read_text(encoding="utf-8"),
-            "new-session-token\n",
-        )
-        self.assertEqual(
-            json.loads((self.tokens / "account_meta.json").read_text(encoding="utf-8")),
+            json.loads(
+                (self.tokens / "renewal_credentials.json").read_text(encoding="utf-8")
+            ),
             {
+                "schema": 1,
                 "email": "renewal@example.invalid",
-                "uid": "new-account-uid",
+                "uid": UID,
+                "session_token": SESSION_TOKEN,
             },
         )
+        self.assertFalse((self.tokens / "session_token.txt").exists())
+        self.assertFalse((self.tokens / "account_meta.json").exists())
         state = load_refresh_state(self.tokens / "refresh_state.json")
         self.assertEqual(state["result"], "success")
         self.assertEqual(state["http_status"], 200)
         self.assertFalse(rejected_marker.exists())
-        for name in ("session_token.txt", "account_meta.json", "proxy_pass.jwt"):
+        for name in ("renewal_credentials.json", "proxy_pass.jwt"):
             mode = stat.S_IMODE((self.tokens / name).stat().st_mode)
             self.assertEqual(mode, 0o600)
 

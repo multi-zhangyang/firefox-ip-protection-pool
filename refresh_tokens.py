@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Long-lived token refresh for Firefox IP Protection.
 
-Uses a stored FxA sessionToken (tokens/session_token.txt + account_meta.json)
-to mint a fresh OAuth access token, then Guardian ProxyPass JWT.  The main
-service runs this helper automatically; operators do not need cron or manual
-ProxyPass replacement.
+Uses the stored FxA renewal credentials to mint a fresh OAuth access token,
+then a Guardian ProxyPass JWT.  The main service runs this helper automatically.
 """
 
 from __future__ import annotations
@@ -17,7 +15,6 @@ import json
 import math
 import os
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +26,11 @@ from fxa.core import Session as FxSession, StretchedPassword
 from fxa.oauth import Client as OAuthClient
 from fxa._utils import APIClient
 
+from renewal_credentials import (
+    RenewalCredentialsError,
+    atomic_write_text,
+    load_renewal_credentials,
+)
 from refresh_state import load_refresh_state, record_refresh_state, refresh_lock, retry_delay
 
 ROOT = Path(__file__).resolve().parent
@@ -43,37 +45,12 @@ ROTATE_BEFORE_SECONDS = 120
 FXA_HTTP_TIMEOUT = (3.0, 7.0)
 EX_TEMPFAIL = 75
 REFRESH_STATE_FILE = TOKENS / "refresh_state.json"
-
-
-def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-            fd = -1
-            tmp.write(content)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        os.replace(tmp_name, path)
-        os.chmod(path, mode)
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            directory_fd = -1
-        if directory_fd >= 0:
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-    except Exception:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-        raise
+REVALIDATE_RESULTS = {
+    "credentials_imported",
+    "rate_limited",
+    "reauth_required",
+    "no_entitlement",
+}
 
 
 def bounded_fxa_api_client(server_url: str) -> APIClient:
@@ -288,14 +265,10 @@ def guardian_request(method: str, path: str, *, headers: dict[str, str], label: 
 
 
 def load_account() -> dict:
-    meta = TOKENS / "account_meta.json"
-    session = TOKENS / "session_token.txt"
-    if not meta.is_file() or not session.is_file():
-        raise SystemExit("missing tokens/account_meta.json or tokens/session_token.txt")
-    data = json.loads(meta.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise SystemExit("tokens/account_meta.json must contain a JSON object")
-    return data
+    try:
+        return load_renewal_credentials(TOKENS)
+    except RenewalCredentialsError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def jwt_seconds_left(token: str, *, now: float | None = None) -> int | None:
@@ -375,6 +348,12 @@ def _refresh_once(*, force: bool) -> int:
         print(time.strftime("%F %T"), f"refresh deferred by persisted cooldown ({wait}s)")
         return EX_TEMPFAIL
 
+    # A blocking result may only be cleared by a real end-to-end renewal.
+    # In particular, a newly imported session must never inherit a still-fresh
+    # ProxyPass that was issued for the previous session merely because this
+    # helper was invoked without --force.
+    force = force or state.get("result") in REVALIDATE_RESULTS
+
     existing = TOKENS / "proxy_pass.jwt"
     if existing.exists() and not force:
         try:
@@ -408,11 +387,7 @@ def _refresh_once(*, force: bool) -> int:
             terminal=True,
         )
 
-    session_path = TOKENS / "session_token.txt"
-    try:
-        session_token = session_path.read_text(encoding="utf-8").strip()
-    except (FileNotFoundError, OSError, UnicodeDecodeError):
-        session_token = ""
+    session_token = str(acc.get("session_token") or "").strip()
     email = str(acc.get("email") or "").strip()
     uid = str(acc.get("uid") or "").strip()
     if not session_token or not email or not uid:

@@ -144,9 +144,6 @@ class RefreshHelperLifecycleTests(unittest.TestCase):
             self.addCleanup(item.stop)
 
     def run_helper(self, guardian_response: Mock, *args: str) -> tuple[int, Mock, Mock]:
-        (self.tokens / "session_token.txt").write_text(
-            "synthetic-session-token\n", encoding="utf-8"
-        )
         oauth = Mock()
         oauth.authorize_token.return_value = "synthetic-access-token"
         stretched = Mock(v1="synthetic-stretched-password")
@@ -157,6 +154,7 @@ class RefreshHelperLifecycleTests(unittest.TestCase):
                 return_value={
                     "email": "synthetic@example.invalid",
                     "uid": "synthetic-uid",
+                    "session_token": "synthetic-session-token",
                 },
             ),
             patch.object(refresh_tokens, "APIClient", return_value=Mock()),
@@ -220,13 +218,10 @@ class RefreshHelperLifecycleTests(unittest.TestCase):
         )
 
         with patch.object(refresh_tokens, "ROOT", Path(self.temp.name)):
-            with self.assertRaisesRegex(SystemExit, "account_meta.json"):
+            with self.assertRaisesRegex(SystemExit, "renewal_credentials.json"):
                 refresh_tokens.load_account()
 
     def test_oauth_429_has_its_own_soft_rate_limit_state(self) -> None:
-        (self.tokens / "session_token.txt").write_text(
-            "synthetic-session-token\n", encoding="utf-8"
-        )
         oauth = Mock()
         oauth.authorize_token.side_effect = ClientError(
             {"code": 429, "errno": 114, "message": "synthetic rate limit"}
@@ -238,6 +233,7 @@ class RefreshHelperLifecycleTests(unittest.TestCase):
                 return_value={
                     "email": "synthetic@example.invalid",
                     "uid": "synthetic-uid",
+                    "session_token": "synthetic-session-token",
                 },
             ),
             patch.object(refresh_tokens, "APIClient", return_value=Mock()),
@@ -315,6 +311,23 @@ class RefreshHelperLifecycleTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         request.assert_called_once()
         self.assertEqual((self.tokens / "proxy_pass.jwt").read_text(encoding="utf-8"), replacement + "\n")
+
+    def test_imported_credentials_bypass_freshness_without_force_flag(self) -> None:
+        now = time.time()
+        current = make_proxy_pass(expires_at=int(now) + 600)
+        replacement = make_proxy_pass(expires_at=int(now) + 900)
+        (self.tokens / "proxy_pass.jwt").write_text(current + "\n", encoding="utf-8")
+        record_refresh_state(self.state_file, "credentials_imported", now=now)
+
+        exit_code, _, request = self.run_helper(response(200, token=replacement))
+
+        self.assertEqual(exit_code, 0)
+        request.assert_called_once()
+        self.assertEqual(
+            (self.tokens / "proxy_pass.jwt").read_text(encoding="utf-8"),
+            replacement + "\n",
+        )
+        self.assertEqual(load_refresh_state(self.state_file)["result"], "success")
 
     def test_force_does_not_bypass_persisted_cooldown(self) -> None:
         now = time.time()

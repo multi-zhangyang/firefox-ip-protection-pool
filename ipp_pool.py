@@ -47,6 +47,11 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import quote, urlsplit
 
+from renewal_credentials import (
+    FILENAME as RENEWAL_CREDENTIALS_FILENAME,
+    RenewalCredentialsError,
+    load_renewal_credentials,
+)
 from refresh_state import load_refresh_state, record_refresh_state, refresh_lock, retry_delay
 
 ROOT = Path(__file__).resolve().parent
@@ -58,7 +63,12 @@ SERVERLIST_CACHE = DATA / "vpn-serverlist.json"
 SERVERLIST_META = DATA / "vpn-serverlist.meta.json"
 PORT_MAP_FILE = DATA / "port-map.json"
 REFRESH_STATE_FILE = TOKENS / "refresh_state.json"
-RENEWAL_BLOCK_RESULTS = {"rate_limited", "reauth_required", "no_entitlement"}
+RENEWAL_BLOCK_RESULTS = {
+    "credentials_imported",
+    "rate_limited",
+    "reauth_required",
+    "no_entitlement",
+}
 
 DEFAULT_GUARDIAN = "https://vpn.mozilla.org"
 DEFAULT_RS = (
@@ -611,6 +621,7 @@ class TokenStore:
         self._fxa_file = token_root / "fxa_token.txt"
         self._session_file = token_root / "session_token.txt"
         self._account_meta_file = token_root / "account_meta.json"
+        self._renewal_credentials_file = token_root / RENEWAL_CREDENTIALS_FILENAME
         self._refresh_state_file = refresh_state_file or token_root / "refresh_state.json"
         self._rejected_token_digests = self._load_rejected_digests()
         self._proxy_marker: tuple[int, int, int] | None = self._file_marker(self._proxy_file)
@@ -715,21 +726,20 @@ class TokenStore:
     def _session_refresh_available(self) -> bool:
         helper = ROOT / "refresh_tokens.py"
         return helper.exists() and bool(
-            load_token_file(self._session_file) or self._account_meta_file.exists()
+            self._renewal_credentials_file.exists()
+            or load_token_file(self._session_file)
+            or self._account_meta_file.exists()
         )
 
     def _automatic_renewal_ready(self) -> bool:
-        session_token = load_token_file(self._session_file)
         try:
-            metadata = json.loads(self._account_meta_file.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return False
-        if not isinstance(metadata, dict):
+            credentials = load_renewal_credentials(self._proxy_file.parent)
+        except (OSError, RenewalCredentialsError):
             return False
         return bool(
-            session_token
-            and str(metadata.get("email") or "").strip()
-            and str(metadata.get("uid") or "").strip()
+            credentials.get("session_token")
+            and credentials.get("email")
+            and credentials.get("uid")
         )
 
     def _sync_refresh_state(self) -> dict:
@@ -2927,20 +2937,20 @@ def cmd_how_to_token(args: argparse.Namespace) -> int:
     """Print a read-only token acquisition guide without exposing credentials."""
     del args
     print(
-        """ProxyPass 凭据说明（本命令不会读取本地凭据）
+        """Firefox 桌面凭据导入
 
-长期运行请不要手工抓取或定期替换 ProxyPass JWT。推荐流程：
-1. 安装 requirements-bootstrap.txt 和 Playwright Firefox。
-2. 运行：python3 login_and_bootstrap.py --email you@example.com
-3. 在终端完成一次密码、邮箱验证码和可能的 CAPTCHA 交互。
-4. 强制验收：python3 refresh_tokens.py --force
-5. 检查：python3 ipp_pool.py token-status
-6. 常驻运行 ipp_pool.py run；后台 worker 会自动长期续期，无需 cron。
+1. 在 Windows 或 macOS 的 Firefox 中登录账户并完成验证码。
+2. 打开 about:profiles，找到当前配置的根目录。
+3. 用 tools/firefox-credential-export.html 读取根目录中的
+   signedInUser.json，下载最小凭据包。
+4. 通过 SSH/SCP 将凭据包传到 VPS，并设置为 0600。
+5. 以服务用户运行：
+   python3 import_credentials.py /path/to/credentials.json --delete-source
+6. 使用 python3 ipp_pool.py token-status 检查续期状态。
 
-只有临时调试时，才从你自己的 Guardian /api/v1/fpn/token 响应中取出
-token 并以 0600 保存到 tokens/proxy_pass.jwt。单独的 ProxyPass 很快到期，
-不能用于无人值守部署。不要把 JWT、session、密码或验证码粘贴到日志、
-shell 历史、issue 或公共节点列表中。
+import_credentials.py 会在导入后强制请求新的 ProxyPass。完整的 Windows、
+macOS 和 systemd 步骤见 README.md。凭据包等同于登录会话，导入成功后应
+删除传输副本。
 """
     )
     return 0
