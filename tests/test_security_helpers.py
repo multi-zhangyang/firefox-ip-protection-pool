@@ -102,6 +102,76 @@ class ProxyPassJwtTests(unittest.TestCase):
                 self.assert_invalid(token)
 
 
+class ProxyUsageTests(unittest.TestCase):
+    def test_unlimited_quota_requires_no_finite_headers(self) -> None:
+        usage = ipp_pool.ProxyUsage.from_headers(
+            {"X-Quota-Unlimited": "true", "Retry-After": "30"}
+        )
+        self.assertTrue(usage.unlimited)
+        self.assertIsNone(usage.limit)
+        self.assertIsNone(usage.remaining)
+        self.assertIsNone(usage.reset)
+        self.assertEqual(usage.retry_after, 30)
+
+    def test_finite_quota_is_strictly_parsed(self) -> None:
+        usage = ipp_pool.ProxyUsage.from_headers(
+            {
+                "X-Quota-Limit": "1000",
+                "X-Quota-Remaining": "250",
+                "X-Quota-Reset": "2026-07-29T00:00:00Z",
+            }
+        )
+        self.assertFalse(usage.unlimited)
+        self.assertEqual(usage.limit, 1000)
+        self.assertEqual(usage.remaining, 250)
+        self.assertEqual(usage.reset, "2026-07-29T00:00:00Z")
+
+    def test_invalid_or_incomplete_quota_is_rejected(self) -> None:
+        invalid_headers = (
+            {},
+            {"X-Quota-Unlimited": "yes"},
+            {"X-Quota-Limit": "100", "X-Quota-Remaining": "10"},
+            {
+                "X-Quota-Limit": "not-an-integer",
+                "X-Quota-Remaining": "10",
+                "X-Quota-Reset": "2026-07-29T00:00:00Z",
+            },
+            {
+                "X-Quota-Limit": "100",
+                "X-Quota-Remaining": "-1",
+                "X-Quota-Reset": "2026-07-29T00:00:00Z",
+            },
+            {
+                "X-Quota-Limit": "100",
+                "X-Quota-Remaining": "101",
+                "X-Quota-Reset": "2026-07-29T00:00:00Z",
+            },
+            {
+                "X-Quota-Limit": "100",
+                "X-Quota-Remaining": "10",
+                "X-Quota-Reset": "2026-07-29T00:00:00",
+            },
+        )
+        for headers in invalid_headers:
+            with self.subTest(headers=headers), self.assertRaises(ValueError):
+                ipp_pool.ProxyUsage.from_headers(headers)
+
+    def test_error_response_can_omit_quota_headers(self) -> None:
+        usage = ipp_pool.ProxyUsage.from_headers(
+            {"Retry-After": "15"},
+            require_quota=False,
+        )
+        self.assertIsNone(usage.unlimited)
+        self.assertEqual(usage.retry_after, 15)
+
+    def test_guardian_headers_match_current_desktop_shape(self) -> None:
+        headers = ipp_pool.guardian_headers("synthetic-access-token")
+        self.assertEqual(headers["Authorization"], "Bearer synthetic-access-token")
+        self.assertEqual(headers["Accept"], "application/json")
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(headers["Cache-Control"], "no-cache")
+
+
 class AuthorityParserTests(unittest.TestCase):
     def parse(self, value: str, default_port: int | None = None) -> tuple[str, int]:
         func = getattr(ipp_pool, "parse_authority", None)

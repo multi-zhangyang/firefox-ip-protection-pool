@@ -185,9 +185,10 @@ def guardian_request(method: str, path: str, *, headers: dict[str, str], label: 
     deadline = started + HTTP_RETRY_BUDGET
     last_error: requests.RequestException | None = None
     request_headers = dict(headers)
-    if method.upper() == "GET" and path == "/api/v1/fpn/token":
-        request_headers["Cache-Control"] = "no-cache"
-        request_headers["Pragma"] = "no-cache"
+    request_headers.setdefault("Accept", "application/json")
+    request_headers.setdefault("Content-Type", "application/json")
+    request_headers.setdefault("Cache-Control", "no-cache")
+    request_headers.setdefault("Pragma", "no-cache")
     for attempt in range(1, HTTP_ATTEMPTS + 1):
         remaining = deadline - time.monotonic()
         if remaining <= 0:

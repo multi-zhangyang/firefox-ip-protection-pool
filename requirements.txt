@@ -1,3 +1,4 @@
+# 核心代理池与无浏览器 token 刷新依赖。
+# 首次浏览器引导请改用 requirements-bootstrap.txt。
 requests>=2.31.0
 PyFxA>=0.7.7
-playwright>=1.40.0

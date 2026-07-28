@@ -1,0 +1,3 @@
+# 可选的 Firefox Accounts 浏览器引导依赖。
+-r requirements.txt
+playwright>=1.40.0

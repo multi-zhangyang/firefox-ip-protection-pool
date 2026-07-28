@@ -20,6 +20,12 @@
 3. Guardian 服务入口（仅作协议形状参考）：
    <https://vpn.mozilla.org>
 4. Firefox 网络代理与 Remote Settings 代码应以目标版本源码为准；服务端记录可能在不发布 Firefox 的情况下变化。
+5. Firefox 主干版本文件：
+   <https://searchfox.org/firefox-main/source/browser/config/version.txt>
+6. Guardian Desktop 请求实现：
+   <https://searchfox.org/firefox-main/rev/4b4e59946a3db5ddf42ea730fc44c22a99877303/toolkit/components/ipprotection/fxa/GuardianClient.sys.mjs>
+7. `vpn-serverlist` 集合签名 metadata：
+   <https://firefox.settings.services.mozilla.com/v1/buckets/main/collections/vpn-serverlist>
 
 ## 现行桌面链路
 
@@ -32,14 +38,14 @@ FxA/OAuth
   -> 目标站点
 ```
 
-Firefox 对 token 请求使用 `Cache-Control: no-cache`；配额查询使用对 token 端点的 `HEAD` 请求。代理层把 `401`、`403`、`407` 视为授权或资格相关错误，普通 `400` 不应盲目触发 token 刷新。
+Firefox 的 token、usage、status 和 activate 请求都发送 `Content-Type: application/json` 并禁用缓存；配额查询使用对 token 端点的 `HEAD` 请求。代理层把 `401`、`403`、`407` 视为授权或资格相关错误，普通 `400` 不应盲目触发 token 刷新。
 
 ## 上游变化与本地适配
 
 | 上游行为 | 兼容策略 | 结果 |
 |---|---|---|
 | `filter_expression` 在 Firefox 选择记录前执行 | 实现受限的 JEXL 子集，版本/国家条件不识别时 fail closed | 不会把版本不匹配的节点暴露给客户端 |
-| 同一国家存在按 Firefox 版本门控的记录 | `--firefox-version` 默认使用当前适配版本，可显式覆盖 | 旧版与新版记录选择一致 |
+| 同一国家存在按 Firefox 版本门控的记录 | 默认跟随 2026-07-28 Firefox 主干 `155.0a1`；可用 `--firefox-version`/`IPP_FIREFOX_VERSION` 覆盖 | 旧版与新版记录选择一致，默认值不会停留在旧主干 |
 | `REC` 是推荐/任意出口记录 | 保留记录但从显式国家和全国家池排除；`--recommended` 才优先使用 | 不把推荐记录误当成某一国家 |
 | 记录或协议缺少端口 | 缺省为 `443`，随后做范围校验 | 兼容省略端口的 Remote Settings 记录 |
 | 协议链可能为 `masque` 后跟 `connect` | 优先选择可用 `connect`；MASQUE-only 节点标记不支持 | 不会静默把 MASQUE 字段当成 CONNECT |
@@ -47,6 +53,8 @@ Firefox 对 token 请求使用 `Cache-Control: no-cache`；配额查询使用对
 | Remote Settings 支持 `ETag`/`304` | 缓存 ETag，使用 `If-None-Match`，304 复用 last-known-good | 减少请求并避免坏响应替换好缓存 |
 | 节点列表重排或插入 | 用节点稳定身份持久化端口映射 | 已分配端口不会因列表顺序改变而漂移 |
 | 同一国家可能包含多个节点 | 综合入口先选择国家，再选择该国节点 | 每个启用国家权重相等，不因节点数量不同而倾斜 |
+| Guardian Desktop 请求统一发送 JSON content type 和 no-cache | token、usage、status、activate 共用相同安全 header 形状 | 避免客户端行为与当前 Firefox 漂移 |
+| `X-Quota-Unlimited: true` 或有限配额三元组 | unlimited 不要求有限字段；否则严格校验 limit/remaining/reset、非负值和时间区 | 坏 quota 不会静默伪装成有效数值，也不会阻止有效 ProxyPass 使用 |
 | Guardian 返回 429/5xx 或 `Retry-After` | 有界重试、尊重有限等待、保留最后有效 token | 避免刷新风暴和凭据回退为空 |
 | 代理 JWT 字段异常或即将过期 | 校验三段结构、必要 claims、issuer/audience、时间关系 | 坏 token 不覆盖 last-good；不输出 token 内容 |
 
@@ -55,7 +63,7 @@ Firefox 对 token 请求使用 `Cache-Control: no-cache`；配额查询使用对
 - 默认启动全部可用的非 `REC` 国家，每个国家使用完全相同的筛选、端口、回退、健康检查和导出逻辑。
 - 每个国家保留独立 SOCKS5/HTTP 节点；综合随机入口在所有已启用国家之间等权选择。
 - `REC` 只属于显式 `--recommended` 模式，不混入普通国家综合池。
-- 默认监听地址为 loopback；非 loopback 监听必须配置完整监听认证，除非显式使用 `--allow-open-proxy`。
+- 默认监听地址为 loopback；独立节点、SOCKS 综合入口和 HTTP 综合入口中的任何一个使用非 loopback 地址时，都必须配置完整监听认证，除非显式使用 `--allow-open-proxy`。
 - HTTP 明文转发只接受 absolute-form `http://`；HTTPS 必须走 `CONNECT`。
 - 拒绝 chunked、冲突或超限 `Content-Length`，并移除 hop-by-hop 与 `Connection` 指定的头。
 - SOCKS5 使用 `socks5h://` 导出，让目标域名在代理端解析。
@@ -78,5 +86,6 @@ python3 -m unittest discover -s tests -v
 
 1. MASQUE/QUIC 与 UDP 转发仍未实现；Firefox 未来可能把 CONNECT fallback 移除。
 2. 当前 JWT 校验验证结构和 claims，不验证 Guardian 签名；若 Guardian 公布稳定 JWKS，应增加可选的密码学验证。
-3. Remote Settings schema、锁定语义和配额 header 可能在服务端热更新；应保留 last-known-good，并定期运行兼容性测试。
-4. 桌面 `fpn` 与 Android `gpn` 端点不能混用；新增移动端支持前应单独完成协议审计。
+3. Firefox 的 `RemoteSettings("vpn-serverlist")` 会验证 Mozilla 内容签名；本项目目前只依赖 HTTPS、ETag、schema 检查与 last-known-good，尚未实现 Kinto canonical records、P-384 内容签名和 Mozilla PKI 证书链的完整验证。不能仅凭 metadata 中存在 `signature` 字段宣称签名有效。
+4. Remote Settings schema、锁定语义和配额 header 仍可能在服务端热更新；应保留 last-known-good，并定期运行兼容性测试。
+5. 桌面 `fpn` 与 Android `gpn` 端点不能混用；新增移动端支持前应单独完成协议审计。

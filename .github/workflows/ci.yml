@@ -1,0 +1,65 @@
+name: CI
+
+'on':
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.12"
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装核心依赖
+        run: python -m pip install -r requirements.txt
+
+      - name: 运行单元测试
+        run: python -m unittest discover -s tests -v
+
+      - name: 检查 Python 语法
+        run: python -m py_compile ipp_pool.py refresh_tokens.py login_and_bootstrap.py
+
+      - name: 检查 Shell 语法
+        run: bash -n run_service.sh start_pool.sh
+
+      - name: 检查提交空白错误
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            git diff --check "$BASE_SHA" HEAD
+          elif [[ "$EVENT_NAME" == "push" && "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]] \
+            && git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            git diff --check "$BEFORE_SHA" HEAD
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          else
+            git show --check --format= HEAD
+          fi

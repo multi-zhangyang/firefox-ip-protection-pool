@@ -18,6 +18,7 @@ import argparse
 import base64
 import email.utils
 import hmac
+import http.client
 import ipaddress
 import json
 import math
@@ -25,7 +26,6 @@ import os
 import random
 import re
 import select
-import shutil
 import signal
 import socket
 import socketserver
@@ -40,6 +40,7 @@ import urllib.error
 import urllib.request
 import warnings
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
@@ -64,8 +65,10 @@ DEFAULT_HTTP_BASE = 31000
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_ROTATOR = "127.0.0.1:1090"
 DEFAULT_HTTP_ROTATOR = "127.0.0.1:8080"
-DEFAULT_FIREFOX_VERSION = "153.0"
+DEFAULT_FIREFOX_VERSION = "155.0a1"
 MAX_FORWARD_BODY = 8 * 1024 * 1024
+MAX_PROBE_RESPONSE = 64 * 1024
+DISABLED_LISTENERS = {"off", "none", "false"}
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -231,6 +234,25 @@ def is_loopback_bind(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def listener_is_disabled(value: str | None) -> bool:
+    return value is not None and value.lower() in DISABLED_LISTENERS
+
+
+def validate_bind_host(value: str) -> str:
+    """Validate a bind-only host and return its normalized authority host."""
+    host, _ = parse_authority(format_authority(value, 1))
+    return host
+
+
+def resolve_listener(value: str | None, bind: str, port: int) -> tuple[str | None, str | None]:
+    """Resolve an optional aggregate listener and validate its authority."""
+    listen = format_authority(bind, port) if value is None else value
+    if listener_is_disabled(listen):
+        return listen, None
+    host, _ = parse_authority(listen)
+    return listen, host
 
 
 def _prepare_forward_request(handler: BaseHTTPRequestHandler) -> tuple[str, int, bytes]:
@@ -447,24 +469,68 @@ class ProxyUsage:
     retry_after: int | None = None
 
     @classmethod
-    def from_headers(cls, headers) -> "ProxyUsage":
-        normalized = {str(k).lower(): str(v) for k, v in headers.items()}
+    def from_headers(cls, headers, *, require_quota: bool = True) -> "ProxyUsage":
+        normalized = {str(k).lower(): str(v) for k, v in (headers.items() if headers else [])}
 
-        def integer(name: str) -> int | None:
+        def integer(name: str) -> int:
             try:
-                return int(normalized[name]) if name in normalized else None
-            except (TypeError, ValueError):
-                return None
+                value = int(normalized[name])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"invalid or missing Guardian header: {name}") from exc
+            if value < 0:
+                raise ValueError(f"Guardian header {name} must be non-negative")
+            return value
 
         unlimited_raw = normalized.get("x-quota-unlimited")
-        unlimited = None if unlimited_raw is None else unlimited_raw.lower() in {"1", "true", "yes"}
+        if unlimited_raw is not None:
+            unlimited_value = unlimited_raw.strip().lower()
+            if unlimited_value not in {"true", "false"}:
+                if require_quota:
+                    raise ValueError("invalid Guardian header: x-quota-unlimited")
+                return cls(retry_after=_retry_after_seconds(normalized.get("retry-after")))
+            if unlimited_value == "true":
+                return cls(
+                    unlimited=True,
+                    retry_after=_retry_after_seconds(normalized.get("retry-after")),
+                )
+
+        quota_headers = ("x-quota-limit", "x-quota-remaining", "x-quota-reset")
+        if not all(normalized.get(name, "").strip() for name in quota_headers):
+            if require_quota:
+                missing = [name for name in quota_headers if not normalized.get(name, "").strip()]
+                raise ValueError(f"missing Guardian quota header(s): {', '.join(missing)}")
+            return cls(retry_after=_retry_after_seconds(normalized.get("retry-after")))
+
+        limit = integer("x-quota-limit")
+        remaining = integer("x-quota-remaining")
+        if remaining > limit:
+            raise ValueError("Guardian quota remaining cannot exceed limit")
+        reset = normalized["x-quota-reset"].strip()
+        try:
+            parsed_reset = datetime.fromisoformat(reset[:-1] + "+00:00" if reset.endswith("Z") else reset)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid Guardian quota reset timestamp") from exc
+        if parsed_reset.tzinfo is None:
+            raise ValueError("Guardian quota reset timestamp must include a timezone")
         return cls(
-            unlimited=unlimited,
-            limit=integer("x-quota-limit"),
-            remaining=integer("x-quota-remaining"),
-            reset=normalized.get("x-quota-reset"),
+            unlimited=False,
+            limit=limit,
+            remaining=remaining,
+            reset=reset,
             retry_after=_retry_after_seconds(normalized.get("retry-after")),
         )
+
+
+def guardian_headers(access_token: str) -> dict[str, str]:
+    """Return the current Firefox Desktop Guardian request headers."""
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "firefox-ip-protection-pool/2.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
 
 class TokenStore:
@@ -609,20 +675,20 @@ class TokenStore:
             url = f"{self.guardian}/api/v1/fpn/token"
             req = urllib.request.Request(
                 url,
-                headers={
-                    "Authorization": f"Bearer {self._fxa_token}",
-                    "Accept": "application/json",
-                    "User-Agent": "firefox-ip-protection-pool/1.0",
-                    "Cache-Control": "no-cache",
-                    "Pragma": "no-cache",
-                },
+                headers=guardian_headers(self._fxa_token),
                 method="GET",
             )
             for attempt in range(3):
                 try:
                     with urllib.request.urlopen(req, timeout=30) as resp:
                         self.last_status = getattr(resp, "status", 200)
-                        self._set_usage(resp.headers)
+                        try:
+                            self._set_usage(resp.headers, require_quota=True)
+                        except ValueError as quota_error:
+                            # Firefox also keeps a valid pass when quota
+                            # headers are malformed, but discards the usage.
+                            self.quota = ProxyUsage()
+                            warnings.warn(f"invalid Guardian quota headers ignored: {quota_error}")
                         data = json.loads(resp.read().decode("utf-8"))
                         token = data.get("token") if isinstance(data, dict) else None
                         if not isinstance(token, str):
@@ -641,7 +707,7 @@ class TokenStore:
                         return
                 except urllib.error.HTTPError as exc:
                     self.last_status = exc.code
-                    self._set_usage(exc.headers)
+                    self._set_usage(exc.headers, require_quota=False)
                     if exc.code == 429:
                         delay = self.quota.retry_after or 60
                         self.retry_at = time.time() + delay
@@ -664,35 +730,29 @@ class TokenStore:
         finally:
             self._refreshing = False
 
-    def _set_usage(self, headers) -> None:
+    def _set_usage(self, headers, *, require_quota: bool) -> None:
         self.usage_headers = {
             k: v
-            for k, v in headers.items()
+            for k, v in (headers.items() if headers else [])
             if k.lower().startswith("x-quota") or k.lower() == "retry-after"
         }
-        self.quota = ProxyUsage.from_headers(headers)
+        self.quota = ProxyUsage.from_headers(headers, require_quota=require_quota)
 
     def usage(self) -> ProxyUsage:
         if not self._fxa_token:
             raise RuntimeError("missing FxA access token for Guardian usage query")
         req = urllib.request.Request(
             f"{self.guardian}/api/v1/fpn/token",
-            headers={
-                "Authorization": f"Bearer {self._fxa_token}",
-                "Accept": "application/json",
-                "User-Agent": "firefox-ip-protection-pool/1.0",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            },
+            headers=guardian_headers(self._fxa_token),
             method="HEAD",
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 self.last_status = getattr(resp, "status", 200)
-                self._set_usage(resp.headers)
+                self._set_usage(resp.headers, require_quota=True)
         except urllib.error.HTTPError as exc:
             self.last_status = exc.code
-            self._set_usage(exc.headers)
+            self._set_usage(exc.headers, require_quota=False)
             if exc.code == 429:
                 delay = self.quota.retry_after or 60
                 self.retry_at = time.time() + delay
@@ -2197,9 +2257,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
         by[n.country] = by.get(n.country, 0) + 1
     for c, cnt in sorted(by.items()):
         print(f"    {c}: {cnt}")
-    (EXPORT / "exits.json").write_text(
+    atomic_write_text(
+        EXPORT / "exits.json",
         json.dumps([asdict(n) for n in nodes], indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
     )
     return 0
 
@@ -2255,6 +2315,51 @@ def cmd_token_refresh(args: argparse.Namespace) -> int:
     return 0
 
 
+def probe_node(node: ExitNode, connector: FastlyConnectClient) -> str:
+    """Fetch a small public egress summary without exposing tokens in argv."""
+    remote: socket.socket | None = None
+    response: http.client.HTTPResponse | None = None
+    try:
+        # The proxy hop is already protected by TLS. The probe response only
+        # contains public egress metadata, so plain HTTP inside CONNECT avoids
+        # unsafe TLS-in-TLS socket wrapping and keeps the token in this process.
+        remote = connector.open_tunnel(
+            node.hostname,
+            node.port,
+            "ipinfo.io",
+            80,
+            timeout=25,
+        )
+        remote.settimeout(25)
+        remote.sendall(
+            b"GET /json HTTP/1.1\r\n"
+            b"Host: ipinfo.io\r\n"
+            b"User-Agent: firefox-ip-protection-pool/2.0\r\n"
+            b"Accept: application/json\r\n"
+            b"Accept-Encoding: identity\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        response = http.client.HTTPResponse(remote)
+        response.begin()
+        if response.status != 200:
+            raise OSError(f"probe endpoint returned HTTP {response.status}")
+        payload = response.read(MAX_PROBE_RESPONSE + 1)
+        if len(payload) > MAX_PROBE_RESPONSE:
+            raise OSError("probe response exceeded size limit")
+        return payload.decode("utf-8", "strict")
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except OSError:
+                pass
+        if remote is not None:
+            try:
+                remote.close()
+            except OSError:
+                pass
+
+
 def cmd_probe(args: argparse.Namespace) -> int:
     ts = build_tokens(args)
     nodes = fetch_serverlist(
@@ -2299,26 +2404,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
         print(f"[!] token: {e}", file=sys.stderr)
         return 1
     print(f"[*] proxy_pass: {json.dumps(jwt_summary(token))}")
-    curl = shutil.which("curl")
-    if not curl:
-        print("[!] curl not found", file=sys.stderr)
-        return 1
-    cmd = [
-        curl,
-        "-sS",
-        "--max-time",
-        "25",
-        "--http1.1",
-        "-x",
-        f"https://{node.hostname}:{node.port}",
-        "--proxy-header",
-        f"Proxy-Authorization: Bearer {token}",
-        "https://ipinfo.io/json",
-    ]
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=30)
+        out = probe_node(node, FastlyConnectClient(ts))
     except Exception as e:
-        print(f"[!] probe failed: {getattr(e, 'output', e)}", file=sys.stderr)
+        print(f"[!] probe failed: {e}", file=sys.stderr)
         return 1
     try:
         probe_data = json.loads(out)
@@ -2349,26 +2438,35 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.limit is not None and args.limit <= 0:
         print("[!] --limit must be a positive integer", file=sys.stderr)
         return 2
-    disabled_rotators = {"off", "none", "false"}
+    if args.no_socks and args.no_http:
+        print("[!] --no-socks and --no-http cannot be used together", file=sys.stderr)
+        return 2
     if args.recommended:
         for option, value in (
             ("--rotator", args.rotator),
             ("--http-rotator", args.http_rotator),
         ):
-            if value is not None and str(value).lower() not in disabled_rotators:
+            if value is not None and not listener_is_disabled(str(value)):
                 print(f"[!] {option} is unavailable in independent REC mode", file=sys.stderr)
                 return 2
 
-    ensure_dirs()
-    ts = build_tokens(args)
     try:
-        tok = ts.ensure()
-        print(f"[*] proxy_pass: {json.dumps(jwt_summary(tok))}")
-    except Exception as e:
-        print(f"[!] token not ready: {e}", file=sys.stderr)
-        if not args.allow_no_token:
-            return 1
+        bind_host = validate_bind_host(args.bind)
+        rotator_listen, rotator_host = resolve_listener(
+            "off" if args.recommended else args.rotator,
+            bind_host,
+            1090,
+        )
+        http_rotator_listen, http_rotator_host = resolve_listener(
+            "off" if args.recommended else args.http_rotator,
+            bind_host,
+            8080,
+        )
+    except ValueError as exc:
+        print(f"[!] invalid listener configuration: {exc}", file=sys.stderr)
+        return 2
 
+    ensure_dirs()
     public_ip = args.advertise_host or os.environ.get("IPP_ADVERTISE_HOST") or args.bind
     auth_user = args.auth_user or os.environ.get("IPP_LISTEN_USER")
     auth_pass = args.auth_pass or os.environ.get("IPP_LISTEN_PASS")
@@ -2385,9 +2483,32 @@ def cmd_run(args: argparse.Namespace) -> int:
     if (auth_user is None) != (auth_pass is None):
         print("[!] both listen username and password are required", file=sys.stderr)
         return 2
-    if not is_loopback_bind(args.bind) and not (auth_user and auth_pass) and not args.allow_open_proxy:
-        print("[!] refusing non-loopback open proxy; configure auth or pass --allow-open-proxy", file=sys.stderr)
+    exposed_listeners = [
+        name
+        for name, host in (
+            ("per-node", bind_host),
+            ("SOCKS5 aggregate", rotator_host),
+            ("HTTP aggregate", http_rotator_host),
+        )
+        if host is not None and not is_loopback_bind(host)
+    ]
+    if exposed_listeners and not (auth_user and auth_pass) and not args.allow_open_proxy:
+        print(
+            "[!] refusing unauthenticated non-loopback listener(s): "
+            + ", ".join(exposed_listeners)
+            + "; configure auth or pass --allow-open-proxy",
+            file=sys.stderr,
+        )
         return 2
+
+    ts = build_tokens(args)
+    try:
+        tok = ts.ensure()
+        print(f"[*] proxy_pass: {json.dumps(jwt_summary(tok))}")
+    except Exception as e:
+        print(f"[!] token not ready: {e}", file=sys.stderr)
+        if not args.allow_no_token:
+            return 1
 
     nodes = fetch_serverlist(
         args.serverlist_url,
@@ -2414,18 +2535,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("[!] no listeners started", file=sys.stderr)
         return 1
 
-    rotator_listen = "off" if args.recommended else args.rotator
-    if rotator_listen is None:
-        rotator_listen = f"{args.bind}:1090"
-    http_rotator_listen = "off" if args.recommended else args.http_rotator
-    if http_rotator_listen is None:
-        http_rotator_listen = f"{args.bind}:8080"
-    rotator_srv = None
-    http_rotator_srv = None
-    if rotator_listen and rotator_listen.lower() not in disabled_rotators:
-        rotator_srv = pool.start_rotator(rotator_listen, mode=args.rotate_mode)
-    if http_rotator_listen and str(http_rotator_listen).lower() not in disabled_rotators:
-        http_rotator_srv = pool.start_http_rotator(http_rotator_listen, mode=args.rotate_mode)
+    if rotator_host is not None:
+        pool.start_rotator(rotator_listen, mode=args.rotate_mode)
+    if http_rotator_host is not None:
+        pool.start_http_rotator(http_rotator_listen, mode=args.rotate_mode)
 
     def refresher() -> None:
         while not pool._stop.is_set():  # noqa: SLF001
@@ -2550,7 +2663,7 @@ def build_parser() -> argparse.ArgumentParser:
         auth_pass=None,
         require_auth=False,
         allow_open_proxy=False,
-        firefox_version=DEFAULT_FIREFOX_VERSION,
+        firefox_version=os.environ.get("IPP_FIREFOX_VERSION", DEFAULT_FIREFOX_VERSION),
         client_country=os.environ.get("IPP_CLIENT_COUNTRY", ""),
         include_locked=False,
         recommended=False,
@@ -2559,7 +2672,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ensure_dirs()
     parser = build_parser()
     args = parser.parse_args(argv)
     return int(args.func(args))

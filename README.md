@@ -76,13 +76,15 @@ git clone https://github.com/multi-zhangyang/firefox-ip-protection-pool.git
 cd firefox-ip-protection-pool
 
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt
 
 # 只同步公开节点列表，不需要读取 token
 .venv/bin/python ipp_pool.py sync
 ```
 
 同步日志只应包含节点数量、国家统计和缓存状态，不应包含账号凭据。上游节点会随 Firefox 版本和服务端配置变化，以当前同步结果为准。
+
+`requirements.txt` 只安装核心代理池和无浏览器 token 刷新所需的 `requests` 与 `PyFxA`，不会安装 Playwright 或下载浏览器。
 
 ## 凭据准备
 
@@ -204,6 +206,8 @@ chmod 600 tokens/proxy_listen_auth.txt
 curl --proxy-user 'USER:PASSWORD' -x socks5h://127.0.0.1:1090 https://ipinfo.io/ip
 ```
 
+安全检查覆盖所有实际监听地址，而不只检查 `--bind`。因此，即使独立节点绑定回环地址，只要 `--rotator` 或 `--http-rotator` 指向非回环 IP、通配地址或 DNS 名称，也必须配置完整认证；非法端口、裸 IPv6 authority 和 URL 形式的监听参数会在读取 token 或访问网络前被拒绝。IPv6 回环默认综合入口会规范化为 `[::1]:1090` 和 `[::1]:8080`。
+
 公网部署还应限制防火墙来源、只开放必要端口并定期轮换密码。`--advertise-host` 只影响导出地址，不改变监听安全策略。
 
 ## 通用服务脚本
@@ -222,6 +226,7 @@ curl --proxy-user 'USER:PASSWORD' -x socks5h://127.0.0.1:1090 https://ipinfo.io/
 | `IPP_ROTATOR` | `<IPP_BIND>:1090` | SOCKS5 综合入口，使用 `off` 可关闭 |
 | `IPP_HTTP_ROTATOR` | `<IPP_BIND>:8080` | HTTP 综合入口，使用 `off` 可关闭 |
 | `IPP_ROTATE_MODE` | `random` | 综合入口模式，可选 `random` 或 `rr` |
+| `IPP_FIREFOX_VERSION` | `155.0a1` | Remote Settings 版本门控使用的 Firefox 版本；需要复现其他版本时覆盖 |
 | `IPP_REFRESH_BEFORE_START` | `1` | 启动前是否尽力刷新一次 token |
 
 示例：
@@ -277,28 +282,43 @@ export/exits.json           # 同步得到的节点详情
 .venv/bin/python ipp_pool.py run --recommended
 ```
 
-`usage` 使用 Guardian 的 `HEAD /api/v1/fpn/token` 查询配额；没有 FxA access token 时会明确失败。`probe` 只应用于你有权使用的出口，输出中也不应包含凭据。
+`usage` 使用 Guardian 的 `HEAD /api/v1/fpn/token` 查询配额；没有 FxA access token 时会明确失败。`probe` 只应用于你有权使用的出口，输出中也不应包含凭据。探测请求现在完全在 Python 进程内建立，不会再把 ProxyPass JWT 放进 `curl` 或其他子进程的命令行；响应大小限制为 64 KiB。
 
 ## 可选浏览器引导工具
 
 `login_and_bootstrap.py` 只用于可选的首次引导，不是启动代理池的必要步骤。Firefox Accounts 可能要求 CAPTCHA、邮箱验证码或其他交互验证。
+
+只有需要该工具时才安装额外依赖和 Chromium：
+
+```bash
+.venv/bin/python -m pip install -r requirements-bootstrap.txt
+.venv/bin/python -m playwright install chromium
+```
+
+Linux 主机如果缺少 Chromium 系统库，可在审核 Playwright 将安装的系统包后，由具有相应权限的管理员执行：
+
+```bash
+.venv/bin/python -m playwright install --with-deps chromium
+```
 
 如果用户主动配置第三方视觉 API，引导工具可能把 CAPTCHA 图片发送给该第三方处理；这会将图像交给外部服务。工具也可能在本地保存登录截图、浏览器 storage 或 Cookie，这些文件可能包含账号信息和会话凭据。使用前应检查配置与第三方隐私政策，使用后妥善保护或清理本地产物，绝不能把它们提交到仓库。
 
 ## Firefox 上游适配说明
 
 - 在客户端执行受限且保守的 `filter_expression` 子集；无法识别的表达式会拒绝匹配。
-- 使用 Firefox 版本比较选择适用记录，可通过 `--firefox-version` 覆盖默认版本。
+- 使用 Firefox 版本比较选择适用记录；截至 2026-07-28，默认跟随 Firefox 主干 `155.0a1`，可通过 `--firefox-version` 或 `IPP_FIREFOX_VERSION` 覆盖。
 - 把 `REC` 与普通国家记录分离。
 - 缺少协议端口时按兼容规则使用 `443`，存在 CONNECT 时优先选择 CONNECT。
 - 默认跳过 `locked`、`quarantined` 和不支持协议的节点；`--include-locked` 只用于诊断。
 - Remote Settings 缓存支持 ETag、304、节点快照差异和最后已知有效回退。
-- Guardian 请求使用 no-cache、有界重试并尊重合理范围内的 `Retry-After`。
+- Guardian token/usage/status/activate 请求对齐当前 Firefox 的 JSON content type 与 no-cache；有限配额严格校验 limit、remaining 和带时区的 reset，仍保留有界重试与 `Retry-After`。
 - ProxyPass JWT 会检查结构、算法字段、必需 claims、时间、issuer 和 audience；当前尚未用 Guardian JWKS 对签名做密码学校验。
 
 更详细的记录见 `docs/firefox-upstream-compatibility.md`。
 
 ## 安全注意事项
+
+如果发现项目漏洞，请按 [`SECURITY.md`](SECURITY.md) 私下报告；不要在公开 issue 中张贴漏洞细节或真实凭据。
 
 - 只操作属于自己且有权使用的账号、token 和出口。
 - 把 FxA session token、ProxyPass JWT、Cookie、HAR、浏览器 storage 和监听密码视为高价值凭据。
@@ -307,6 +327,7 @@ export/exits.json           # 同步得到的节点详情
 - Guardian 可能返回配额耗尽或限流；程序会尊重服务端响应，不能绕过配额。
 - 当前实现只提供 TCP CONNECT 兼容性，不等同于完整 VPN，也不支持 UDP/MASQUE 数据面。
 - JWT 当前未做签名密码学验证；不应把本地结构校验理解为对 token 来源的完整信任证明。
+- 节点列表目前依赖 HTTPS、schema、ETag 和 last-known-good；尚未实现 Firefox Remote Settings 使用的 Kinto canonical records、P-384 内容签名与 Mozilla PKI 证书链验证。metadata 中出现签名字段不等于本项目已经完成签名验证。
 
 ## 开发与测试
 
@@ -317,7 +338,7 @@ bash -n run_service.sh start_pool.sh
 git diff --check
 ```
 
-测试覆盖 Remote Settings 解析与版本筛选、`REC` 语义、CONNECT/MASQUE 选择、JWT claims、authority 解析、监听认证、HTTP framing、非幂等请求重放防护、原子写入、稳定端口映射、国家等权候选选择和进程生命周期。
+测试覆盖 Remote Settings 解析与版本筛选、`REC` 语义、CONNECT/MASQUE 选择、JWT claims、authority 解析、所有监听器的开放代理防护、IPv6 综合入口、无子进程 token 探测、HTTP framing、非幂等请求重放防护、原子写入、稳定端口映射、国家等权候选选择和进程生命周期。GitHub Actions 会在 Python 3.10 与 3.12 上重复执行测试和静态检查。
 
 ## 许可证与声明
 

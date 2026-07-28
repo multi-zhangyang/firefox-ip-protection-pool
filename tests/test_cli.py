@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
@@ -49,6 +50,15 @@ class RunCliValidationTests(unittest.TestCase):
     def test_run_defaults_to_random_rotation(self) -> None:
         args = self.parser.parse_args(["run"])
         self.assertEqual(args.rotate_mode, "random")
+
+    def test_parser_tracks_current_firefox_version_and_allows_env_override(self) -> None:
+        self.assertEqual(
+            self.parser.parse_args(["sync"]).firefox_version,
+            "155.0a1",
+        )
+        with patch.dict(os.environ, {"IPP_FIREFOX_VERSION": "156.0b2"}):
+            overridden = ipp_pool.build_parser().parse_args(["sync"])
+        self.assertEqual(overridden.firefox_version, "156.0b2")
 
     def test_countries_and_recommended_conflict_before_token_or_network(self) -> None:
         self.assert_invalid_before_io("--countries", "US,DE", "--recommended")
@@ -104,12 +114,8 @@ class ProbeDefaultSelectionTests(unittest.TestCase):
             patch.object(ipp_pool, "fetch_serverlist", return_value=self.nodes),
             patch.object(ipp_pool.random, "choice", side_effect=fair_choice),
             patch.object(ipp_pool, "jwt_summary", return_value={"valid": True}),
-            patch.object(ipp_pool.shutil, "which", return_value="/usr/bin/curl"),
-            patch.object(
-                ipp_pool.subprocess,
-                "check_output",
-                return_value='{"country":"ZZ"}',
-            ),
+            patch.object(ipp_pool, "probe_node", return_value='{"country":"ZZ"}') as probe,
+            patch.object(ipp_pool.subprocess, "check_output") as child_process,
             redirect_stdout(io.StringIO()),
             redirect_stderr(io.StringIO()),
         ):
@@ -117,6 +123,54 @@ class ProbeDefaultSelectionTests(unittest.TestCase):
             self.assertEqual(ipp_pool.cmd_probe(self.args()), 0)
 
         self.assertEqual(country_choices, [["DE", "US"], ["DE", "US"]])
+        self.assertEqual(probe.call_count, 2)
+        child_process.assert_not_called()
+
+
+class ProbeTransportTests(unittest.TestCase):
+    def test_probe_uses_bounded_in_process_http_transport(self) -> None:
+        node = _node("US", "us-a.example.invalid")
+        remote = Mock()
+        connector = Mock()
+        connector.open_tunnel.return_value = remote
+        response = Mock(status=200)
+        response.read.return_value = b'{"country":"US"}'
+
+        with patch.object(ipp_pool.http.client, "HTTPResponse", return_value=response):
+            payload = ipp_pool.probe_node(node, connector)
+
+        self.assertEqual(payload, '{"country":"US"}')
+        connector.open_tunnel.assert_called_once_with(
+            node.hostname,
+            node.port,
+            "ipinfo.io",
+            80,
+            timeout=25,
+        )
+        remote.settimeout.assert_called_once_with(25)
+        request = remote.sendall.call_args.args[0]
+        self.assertIn(b"GET /json HTTP/1.1", request)
+        self.assertNotIn(b"Proxy-Authorization", request)
+        response.read.assert_called_once_with(ipp_pool.MAX_PROBE_RESPONSE + 1)
+        response.close.assert_called_once()
+        remote.close.assert_called_once()
+
+    def test_probe_rejects_oversized_response_and_closes_tunnel(self) -> None:
+        node = _node("US", "us-a.example.invalid")
+        remote = Mock()
+        connector = Mock()
+        connector.open_tunnel.return_value = remote
+        response = Mock(status=200)
+        response.read.return_value = b"x" * (ipp_pool.MAX_PROBE_RESPONSE + 1)
+
+        with (
+            patch.object(ipp_pool.http.client, "HTTPResponse", return_value=response),
+            self.assertRaisesRegex(OSError, "size limit"),
+        ):
+            ipp_pool.probe_node(node, connector)
+
+        response.close.assert_called_once()
+        remote.close.assert_called_once()
 
 
 if __name__ == "__main__":
