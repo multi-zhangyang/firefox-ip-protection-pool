@@ -2,16 +2,17 @@
 """Long-lived token refresh for Firefox IP Protection.
 
 Uses a stored FxA sessionToken (tokens/session_token.txt + account_meta.json)
-to mint a fresh OAuth access token, then Guardian ProxyPass JWT.
-
-Cron:
-  */4 * * * * cd /path/to/firefox-ip-protection-pool && .venv/bin/python refresh_tokens.py >> logs/refresh.log 2>&1
+to mint a fresh OAuth access token, then Guardian ProxyPass JWT.  The main
+service runs this helper automatically; operators do not need cron or manual
+ProxyPass replacement.
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import binascii
+from contextlib import contextmanager
 import email.utils
 import fcntl
 import json
@@ -20,15 +21,17 @@ import os
 import sys
 import tempfile
 import time
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlsplit
 
 import requests
 from fxa.core import Session as FxSession, StretchedPassword
 from fxa.oauth import Client as OAuthClient
 from fxa._utils import APIClient
+
+from refresh_state import load_refresh_state, record_refresh_state, retry_delay
 
 ROOT = Path(__file__).resolve().parent
 TOKENS = ROOT / "tokens"
@@ -38,6 +41,10 @@ SCOPES = "profile https://identity.mozilla.com/apps/vpn"
 GUARDIAN = "https://vpn.mozilla.org"
 HTTP_ATTEMPTS = 3
 HTTP_RETRY_BUDGET = 30.0
+ROTATE_BEFORE_SECONDS = 120
+FXA_HTTP_TIMEOUT = (3.0, 7.0)
+EX_TEMPFAIL = 75
+REFRESH_STATE_FILE = TOKENS / "refresh_state.json"
 
 
 def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
@@ -51,6 +58,16 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
             tmp.flush()
             os.fsync(tmp.fileno())
         os.replace(tmp_name, path)
+        os.chmod(path, mode)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = -1
+        if directory_fd >= 0:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     except Exception:
         if fd >= 0:
             os.close(fd)
@@ -59,6 +76,41 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+@contextmanager
+def refresh_lock(token_dir: Path, *, blocking: bool) -> Iterator[None]:
+    """Serialize refresh and credential publication across processes.
+
+    A bootstrap only holds this lock while publishing already-obtained
+    credentials.  This lets an in-flight helper finish before the new session
+    and its success state become visible, preventing a stale 401 from
+    overwriting a freshly bootstrapped session.
+    """
+    token_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = token_dir / ".refresh.lock"
+    lock_handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        os.chmod(lock_path, 0o600)
+        operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        fcntl.flock(lock_handle.fileno(), operation)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_handle.close()
+
+
+def bounded_fxa_api_client(server_url: str) -> APIClient:
+    """Build a PyFxA client without adapter retries and with finite I/O."""
+    session = requests.Session()
+    client = APIClient(server_url, session=session)
+    client.timeout = FXA_HTTP_TIMEOUT
+    return client
 
 
 class ProxyPassValidationError(ValueError):
@@ -97,6 +149,7 @@ def validate_proxy_pass_jwt(
     token: str,
     now: float | None = None,
     guardian: str = GUARDIAN,
+    min_ttl: float = 0,
 ) -> dict[str, Any]:
     """Validate JWT structure and time claims without logging token material."""
     if not isinstance(token, str):
@@ -157,9 +210,11 @@ def validate_proxy_pass_jwt(
     if timestamps["nbf"] > current:
         skew = int(math.ceil(timestamps["nbf"] - current))
         raise ProxyPassValidationError(f"ProxyPass JWT is not valid yet; check system clock ({skew}s)")
-    if current >= timestamps["exp"]:
+    if current + max(0.0, float(min_ttl)) >= timestamps["exp"]:
         age = int(math.floor(current - timestamps["exp"]))
-        raise ProxyPassValidationError(f"ProxyPass JWT is expired ({age}s); check system clock")
+        if current >= timestamps["exp"]:
+            raise ProxyPassValidationError(f"ProxyPass JWT is expired ({age}s); check system clock")
+        raise ProxyPassValidationError("ProxyPass JWT is too close to expiry")
     return payload
 
 
@@ -168,7 +223,11 @@ def _retry_after_seconds(value: str | None) -> float | None:
         return None
     try:
         seconds = float(value.strip())
-        return max(0.0, seconds) if math.isfinite(seconds) else None
+        # RFC 9110 delay-seconds is a non-negative decimal integer.  We accept
+        # finite fractional values for robustness, but a negative value is not
+        # a valid "retry now" instruction: falling back to exponential
+        # backoff avoids a tight refresh loop on a malformed response.
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
     except ValueError:
         try:
             retry_at = email.utils.parsedate_to_datetime(value)
@@ -179,8 +238,26 @@ def _retry_after_seconds(value: str | None) -> float | None:
             return None
 
 
+def _quota_reset_seconds(value: str | None, *, now: float | None = None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    current = time.time() if now is None else float(now)
+    return max(0.0, parsed.timestamp() - current)
+
+
 def guardian_request(method: str, path: str, *, headers: dict[str, str], label: str) -> requests.Response:
-    """Perform a bounded Guardian request retrying rate limits and transient failures."""
+    """Perform a bounded Guardian request, retrying only transient failures.
+
+    Firefox treats a token-endpoint 429 as quota exhaustion.  Returning it
+    immediately lets the caller persist a single cooldown instead of turning a
+    quota response into a request storm.
+    """
     started = time.monotonic()
     deadline = started + HTTP_RETRY_BUDGET
     last_error: requests.RequestException | None = None
@@ -194,11 +271,16 @@ def guardian_request(method: str, path: str, *, headers: dict[str, str], label: 
         if remaining <= 0:
             break
         try:
+            # requests applies connect and read timeouts separately.  Split the
+            # remaining wall-clock budget between them so one attempt cannot
+            # intentionally consume two full budgets.
+            connect_timeout = min(5.0, max(0.1, remaining / 3.0))
+            read_timeout = max(0.1, remaining - connect_timeout)
             response = requests.request(
                 method,
                 f"{GUARDIAN}{path}",
                 headers=request_headers,
-                timeout=(min(5.0, remaining), min(15.0, remaining)),
+                timeout=(connect_timeout, read_timeout),
             )
         except requests.RequestException as exc:
             last_error = exc
@@ -212,17 +294,20 @@ def guardian_request(method: str, path: str, *, headers: dict[str, str], label: 
             time.sleep(delay)
             continue
 
-        if response.status_code != 429 and not 500 <= response.status_code <= 599:
+        if response.status_code == 429:
+            return response
+        if not 500 <= response.status_code <= 599:
             return response
         retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
         delay = retry_after if retry_after is not None else float(2 ** (attempt - 1))
         remaining = deadline - time.monotonic()
         if attempt == HTTP_ATTEMPTS or delay > remaining:
-            if response.status_code == 429:
-                suffix = f"; retry after {delay:g}s" if retry_after is not None else ""
-                print(time.strftime("%F %T"), label, f"rate limited (HTTP 429){suffix}", file=sys.stderr)
-            else:
-                print(time.strftime("%F %T"), label, f"transient Guardian error HTTP {response.status_code}", file=sys.stderr)
+            print(
+                time.strftime("%F %T"),
+                label,
+                f"transient Guardian error HTTP {response.status_code}",
+                file=sys.stderr,
+            )
             return response
         print(time.strftime("%F %T"), label, f"HTTP {response.status_code}; retrying in {delay:g}s")
         time.sleep(delay)
@@ -233,74 +318,145 @@ def guardian_request(method: str, path: str, *, headers: dict[str, str], label: 
 
 def load_account() -> dict:
     meta = TOKENS / "account_meta.json"
-    if meta.exists():
-        data = json.loads(meta.read_text(encoding="utf-8"))
-        if data.get("sessionToken") or (TOKENS / "session_token.txt").exists():
-            return data
-    st = ROOT / "data" / "ff_storage.json"
-    if not st.exists():
-        raise SystemExit("no account_meta.json / ff_storage.json")
-    data = json.loads(st.read_text(encoding="utf-8"))
-    for o in data.get("origins", []):
-        for item in o.get("localStorage", []):
-            if item["name"] == "__fxa_storage.accounts":
-                acc = list(json.loads(item["value"]).values())[0]
-                return {
-                    "email": acc["email"],
-                    "uid": acc["uid"],
-                    "sessionToken": acc["sessionToken"],
-                }
-    raise SystemExit("session not found")
+    session = TOKENS / "session_token.txt"
+    if not meta.is_file() or not session.is_file():
+        raise SystemExit("missing tokens/account_meta.json or tokens/session_token.txt")
+    data = json.loads(meta.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit("tokens/account_meta.json must contain a JSON object")
+    return data
 
 
-def jwt_seconds_left(token: str) -> int | None:
+def jwt_seconds_left(token: str, *, now: float | None = None) -> int | None:
     try:
-        body = validate_proxy_pass_jwt(token)
-        return int(float(body["exp"]) - time.time())
+        current = time.time() if now is None else float(now)
+        body = validate_proxy_pass_jwt(token, now=current)
+        return int(float(body["exp"]) - current)
     except ProxyPassValidationError:
         return None
 
 
-def main() -> int:
-    TOKENS.mkdir(exist_ok=True)
-    LOGS.mkdir(exist_ok=True)
-
-    lock_path = TOKENS / ".refresh.lock"
-    lock_fh = open(lock_path, "a+", encoding="utf-8")
-    os.chmod(lock_path, 0o600)
+def _remove_legacy_access_token() -> bool:
+    """Remove the formerly persisted OAuth token without reading it."""
     try:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print(time.strftime("%F %T"), "another refresh in progress, skip")
-        return 0
+        (TOKENS / "fxa_token.txt").unlink()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        print(
+            time.strftime("%F %T"),
+            f"could not remove legacy OAuth cache ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
-    try:
-        # Skip if current proxy pass still fresh (>3 min)
-        existing = TOKENS / "proxy_pass.jwt"
-        if existing.exists():
-            left = jwt_seconds_left(existing.read_text(encoding="utf-8").strip())
-            if left is not None and left > 180:
-                print(time.strftime("%F %T"), f"proxy_pass still fresh ({left}s left), skip")
+
+def _exception_status(error: BaseException) -> int | None:
+    value = getattr(error, "code", None)
+    if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+        return value
+    return None
+
+
+def _record_failure(
+    result: str,
+    state: dict[str, Any],
+    *,
+    now: float,
+    http_status: int | None = None,
+    retry_after: float | None = None,
+    terminal: bool = False,
+) -> int:
+    failures = int(state.get("consecutive_failures") or 0)
+    delay = (
+        max(0.0, float(retry_after))
+        if retry_after is not None
+        else (300.0 if terminal else retry_delay(failures))
+    )
+    record_refresh_state(
+        REFRESH_STATE_FILE,
+        result,
+        now=now,
+        http_status=http_status,
+        next_attempt_at=now + delay,
+    )
+    status_text = f" http={http_status}" if http_status is not None else ""
+    print(
+        time.strftime("%F %T"),
+        f"refresh result={result}{status_text}; retry in {int(math.ceil(delay))}s",
+        file=sys.stderr,
+    )
+    return EX_TEMPFAIL if result in {"rate_limited", "transient_error"} else 1
+
+
+def _refresh_once(*, force: bool) -> int:
+    now = time.time()
+    state = load_refresh_state(REFRESH_STATE_FILE)
+    next_attempt_at = state.get("next_attempt_at")
+    if (
+        isinstance(next_attempt_at, (int, float))
+        and not isinstance(next_attempt_at, bool)
+        and math.isfinite(float(next_attempt_at))
+        and float(next_attempt_at) > now
+    ):
+        wait = int(math.ceil(float(next_attempt_at) - now))
+        print(time.strftime("%F %T"), f"refresh deferred by persisted cooldown ({wait}s)")
+        return EX_TEMPFAIL
+
+    existing = TOKENS / "proxy_pass.jwt"
+    if existing.exists() and not force:
+        try:
+            existing_token = existing.read_text(encoding="utf-8").strip()
+            claims = validate_proxy_pass_jwt(existing_token, now=now)
+        except (OSError, ProxyPassValidationError):
+            pass
+        else:
+            expires_at = float(claims["exp"])
+            remaining = expires_at - now
+            seconds_left = int(math.ceil(remaining))
+            if remaining > ROTATE_BEFORE_SECONDS:
+                record_refresh_state(
+                    REFRESH_STATE_FILE,
+                    "fresh",
+                    now=now,
+                    proxy_pass_expires_at=expires_at,
+                )
+                print(time.strftime("%F %T"), f"proxy_pass still fresh ({seconds_left}s left), skip")
                 return 0
 
-        acc = load_account()
-        session_path = TOKENS / "session_token.txt"
-        session_token = (
-            session_path.read_text(encoding="utf-8").strip()
-            if session_path.exists()
-            else (acc.get("sessionToken") or "")
-        )
-        if not session_token:
-            print("missing session token", file=sys.stderr)
-            return 1
-        email = acc.get("email") or ""
-        uid = acc.get("uid") or ""
-        if not email or not uid:
-            print("missing email/uid in account meta", file=sys.stderr)
-            return 1
+    record_refresh_state(REFRESH_STATE_FILE, "in_progress", now=now)
 
-        server = "https://api.accounts.firefox.com/v1"
-        apiclient = APIClient(server)
+    try:
+        acc = load_account()
+    except (SystemExit, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _record_failure(
+            "missing_credentials",
+            state,
+            now=time.time(),
+            terminal=True,
+        )
+
+    session_path = TOKENS / "session_token.txt"
+    try:
+        session_token = session_path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        session_token = ""
+    email = str(acc.get("email") or "").strip()
+    uid = str(acc.get("uid") or "").strip()
+    if not session_token or not email or not uid:
+        return _record_failure(
+            "missing_credentials",
+            state,
+            now=time.time(),
+            terminal=True,
+        )
+
+    server = "https://api.accounts.firefox.com/v1"
+    oauth: OAuthClient | None = None
+    access: str | None = None
+    try:
+        apiclient = bounded_fxa_api_client(server)
         sp = StretchedPassword(1, email, None, "x", None)
 
         class Dummy:
@@ -317,8 +473,37 @@ def main() -> int:
             verified=False,
             auth_timestamp=int(time.time() * 1000),
         )
-        oauth = OAuthClient(client_id=FX_CLIENT_ID, server_url="https://oauth.accounts.firefox.com/v1")
-        access = oauth.authorize_token(session, scope=SCOPES, client_id=FX_CLIENT_ID)
+        oauth_server = "https://oauth.accounts.firefox.com/v1"
+        oauth = OAuthClient(client_id=FX_CLIENT_ID, server_url=oauth_server)
+        # OAuthClient creates a retrying APIClient internally.  Replace it so
+        # the helper has a predictable total runtime and the supervising
+        # service does not kill a legitimate slow refresh halfway through.
+        oauth.apiclient = bounded_fxa_api_client(oauth_server)
+        try:
+            access_value = oauth.authorize_token(session, scope=SCOPES, client_id=FX_CLIENT_ID)
+        except Exception as exc:
+            status = _exception_status(exc)
+            if status == 429:
+                result = "rate_limited"
+            elif status is not None and 400 <= status <= 499:
+                result = "reauth_required"
+            else:
+                result = "transient_error"
+            return _record_failure(
+                result,
+                state,
+                now=time.time(),
+                http_status=status,
+                terminal=result == "reauth_required",
+            )
+        if not isinstance(access_value, str) or not access_value.strip():
+            return _record_failure(
+                "reauth_required",
+                state,
+                now=time.time(),
+                terminal=True,
+            )
+        access = access_value.strip()
 
         headers = {
             "Authorization": f"Bearer {access}",
@@ -327,64 +512,179 @@ def main() -> int:
             "Pragma": "no-cache",
             "User-Agent": "firefox-ip-protection-pool/1.0",
         }
-        r = guardian_request("GET", "/api/v1/fpn/token", headers=headers, label="fpn/token")
-        if r.status_code in (401, 403, 404):
-            ar = guardian_request("POST", "/api/v1/fpn/activate", headers=headers, label="fpn/activate")
-            print(time.strftime("%F %T"), "fpn/activate", f"HTTP {ar.status_code}")
-            if not ar.ok:
-                retry_after = _retry_after_seconds(ar.headers.get("Retry-After"))
-                suffix = f"; retry after {retry_after:g}s" if ar.status_code == 429 and retry_after is not None else ""
-                print(time.strftime("%F %T"), f"fpn/activate failed: HTTP {ar.status_code}{suffix}", file=sys.stderr)
-                return 1
-            r = guardian_request("GET", "/api/v1/fpn/token", headers=headers, label="fpn/token")
-        if not r.ok:
-            retry_after = _retry_after_seconds(r.headers.get("Retry-After"))
-            suffix = f"; retry after {retry_after:g}s" if r.status_code == 429 and retry_after is not None else ""
-            print(time.strftime("%F %T"), f"fpn/token failed: HTTP {r.status_code}{suffix}", file=sys.stderr)
-            return 1
         try:
-            token_response = r.json()
-        except requests.exceptions.JSONDecodeError:
-            print(time.strftime("%F %T"), "fpn/token returned invalid JSON", file=sys.stderr)
-            return 1
+            response = guardian_request(
+                "GET",
+                "/api/v1/fpn/token",
+                headers=headers,
+                label="fpn/token",
+            )
+        except GuardianRequestError:
+            return _record_failure(
+                "transient_error",
+                state,
+                now=time.time(),
+            )
+
+        status = int(response.status_code)
+        retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+        if status == 429:
+            if retry_after is None:
+                retry_after = _quota_reset_seconds(
+                    response.headers.get("X-Quota-Reset"),
+                    now=time.time(),
+                )
+            return _record_failure(
+                "rate_limited",
+                state,
+                now=time.time(),
+                http_status=status,
+                retry_after=retry_after,
+            )
+        if status == 401:
+            return _record_failure(
+                "reauth_required",
+                state,
+                now=time.time(),
+                http_status=status,
+                terminal=True,
+            )
+        if status == 403:
+            return _record_failure(
+                "no_entitlement",
+                state,
+                now=time.time(),
+                http_status=status,
+                terminal=True,
+            )
+        if status == 404:
+            return _record_failure(
+                "protocol_error",
+                state,
+                now=time.time(),
+                http_status=status,
+                terminal=True,
+            )
+        if 500 <= status <= 599:
+            return _record_failure(
+                "transient_error",
+                state,
+                now=time.time(),
+                http_status=status,
+                retry_after=retry_after,
+            )
+        if status != 200:
+            return _record_failure(
+                "protocol_error",
+                state,
+                now=time.time(),
+                http_status=status,
+                terminal=True,
+            )
+
+        try:
+            token_response = response.json()
+        except (requests.exceptions.JSONDecodeError, ValueError):
+            return _record_failure(
+                "protocol_error",
+                state,
+                now=time.time(),
+                http_status=status,
+                terminal=True,
+            )
         tok = token_response.get("token") if isinstance(token_response, dict) else None
         if not isinstance(tok, str) or not tok:
-            print(time.strftime("%F %T"), "fpn/token response has no token field", file=sys.stderr)
-            return 1
+            return _record_failure(
+                "protocol_error",
+                state,
+                now=time.time(),
+                http_status=status,
+                terminal=True,
+            )
         try:
-            claims = validate_proxy_pass_jwt(tok)
-        except ProxyPassValidationError as exc:
-            print(time.strftime("%F %T"), f"rejected ProxyPass JWT: {exc}", file=sys.stderr)
-            return 1
+            validation_now = time.time()
+            claims = validate_proxy_pass_jwt(
+                tok,
+                now=validation_now,
+                min_ttl=ROTATE_BEFORE_SECONDS,
+            )
+        except ProxyPassValidationError:
+            return _record_failure(
+                "protocol_error",
+                state,
+                now=time.time(),
+                http_status=status,
+                terminal=True,
+            )
 
-        # Commit the access token only after its corresponding ProxyPass passes validation.
-        atomic_write_text(TOKENS / "fxa_token.txt", access + "\n")
         atomic_write_text(TOKENS / "proxy_pass.jwt", tok + "\n")
-        atomic_write_text(TOKENS / "session_token.txt", session_token + "\n")
-        # keep account meta in sync
-        acc["sessionToken"] = session_token
-        atomic_write_text(TOKENS / "account_meta.json", json.dumps(acc, indent=2) + "\n")
-        quota = {k: v for k, v in r.headers.items() if k.lower().startswith("x-quota")}
+        expires_at = float(claims["exp"])
+        record_refresh_state(
+            REFRESH_STATE_FILE,
+            "success",
+            now=time.time(),
+            http_status=status,
+            proxy_pass_expires_at=expires_at,
+        )
         print(
             time.strftime("%F %T"),
             "refreshed proxy_pass; seconds_left=",
-            int(float(claims["exp"]) - time.time()),
-            "quota",
-            quota,
+            int(expires_at - time.time()),
         )
         return 0
     finally:
-        try:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        lock_fh.close()
+        if oauth is not None and access:
+            try:
+                oauth.destroy_token(access)
+            except Exception as exc:
+                print(
+                    time.strftime("%F %T"),
+                    f"OAuth token destroy failed ({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Refresh a Firefox IP Protection ProxyPass")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="request a new ProxyPass even if the current pass is fresh (cooldowns still apply)",
+    )
+    args = parser.parse_args(argv)
+
+    TOKENS.mkdir(exist_ok=True)
+    LOGS.mkdir(exist_ok=True)
+    try:
+        with refresh_lock(TOKENS, blocking=False):
+            if not _remove_legacy_access_token():
+                state = load_refresh_state(REFRESH_STATE_FILE)
+                return _record_failure(
+                    "transient_error",
+                    state,
+                    now=time.time(),
+                )
+            try:
+                return _refresh_once(force=args.force)
+            except Exception as exc:
+                print(
+                    time.strftime("%F %T"),
+                    f"token refresh failed ({type(exc).__name__})",
+                    file=sys.stderr,
+                )
+                try:
+                    state = load_refresh_state(REFRESH_STATE_FILE)
+                    return _record_failure(
+                        "transient_error",
+                        state,
+                        now=time.time(),
+                    )
+                except Exception:
+                    return EX_TEMPFAIL
+    except BlockingIOError:
+        print(time.strftime("%F %T"), "another refresh is in progress", file=sys.stderr)
+        return EX_TEMPFAIL
 
 
 if __name__ == "__main__":
-    try:
-        exit_code = main()
-    except Exception as exc:
-        print(time.strftime("%F %T"), f"token refresh failed ({type(exc).__name__})", file=sys.stderr)
-        exit_code = 1
-    raise SystemExit(exit_code)
+    raise SystemExit(main())

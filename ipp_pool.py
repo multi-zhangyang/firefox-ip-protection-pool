@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import email.utils
+import hashlib
 import hmac
 import http.client
 import ipaddress
@@ -46,6 +47,8 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import quote, urlsplit
 
+from refresh_state import load_refresh_state, record_refresh_state, retry_delay
+
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 EXPORT = ROOT / "export"
@@ -54,6 +57,8 @@ TOKENS = ROOT / "tokens"
 SERVERLIST_CACHE = DATA / "vpn-serverlist.json"
 SERVERLIST_META = DATA / "vpn-serverlist.meta.json"
 PORT_MAP_FILE = DATA / "port-map.json"
+REFRESH_STATE_FILE = TOKENS / "refresh_state.json"
+RENEWAL_BLOCK_RESULTS = {"rate_limited", "reauth_required", "no_entitlement"}
 
 DEFAULT_GUARDIAN = "https://vpn.mozilla.org"
 DEFAULT_RS = (
@@ -68,6 +73,11 @@ DEFAULT_HTTP_ROTATOR = "127.0.0.1:8080"
 DEFAULT_FIREFOX_VERSION = "155.0a1"
 MAX_FORWARD_BODY = 8 * 1024 * 1024
 MAX_PROBE_RESPONSE = 64 * 1024
+# refresh_tokens.py bounds Guardian work to 30 seconds and gives each PyFxA
+# request a 3-second connect plus 7-second read timeout.  PyFxA may repeat a
+# request once for clock-skew correction, so the supervisor leaves enough
+# room for the complete authorize/fetch/destroy flow without waiting forever.
+REFRESH_HELPER_TIMEOUT_SECONDS = 100
 DISABLED_LISTENERS = {"off", "none", "false"}
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -110,6 +120,15 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o644) -> None:
             os.fsync(handle.fileno())
         os.replace(tmp, path)
         os.chmod(path, mode)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = -1
+        if directory_fd >= 0:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     except Exception:
         try:
             os.close(fd)
@@ -447,6 +466,13 @@ def jwt_summary(token: str) -> dict:
         return {"error": str(e), "valid": False}
 
 
+def safe_jwt_summary(token: str) -> dict:
+    """Return operational JWT timing without the account subject identifier."""
+    summary = jwt_summary(token)
+    summary.pop("sub", None)
+    return summary
+
+
 def _retry_after_seconds(value: str | None, now: float | None = None) -> int | None:
     if not value:
         return None
@@ -458,6 +484,23 @@ def _retry_after_seconds(value: str | None, now: float | None = None) -> int | N
     except (TypeError, ValueError, OverflowError):
         return None
     return max(0, int(when - (time.time() if now is None else now)))
+
+
+def _quota_reset_seconds(value: str | None, now: float | None = None) -> int | None:
+    """Convert Guardian's timezone-aware quota reset into a safe delay."""
+    if not value:
+        return None
+    normalized = value.strip()
+    try:
+        reset = datetime.fromisoformat(
+            normalized[:-1] + "+00:00" if normalized.endswith("Z") else normalized
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if reset.tzinfo is None:
+        return None
+    current = time.time() if now is None else now
+    return max(0, int(reset.timestamp() - current))
 
 
 @dataclass
@@ -534,7 +577,7 @@ def guardian_headers(access_token: str) -> dict[str, str]:
 
 
 class TokenStore:
-    """Thread-safe ProxyPass holder with single-flight refresh."""
+    """Thread-safe ProxyPass holder with non-blocking state reads and single-flight renewal."""
 
     def __init__(
         self,
@@ -542,79 +585,210 @@ class TokenStore:
         fxa_token: str | None = None,
         guardian: str = DEFAULT_GUARDIAN,
         rotate_skew: int = 120,
+        usable_skew: int = 5,
+        token_dir: Path | None = None,
+        refresh_state_file: Path | None = None,
     ) -> None:
         self._lock = threading.RLock()
+        # Slow helper/network work is serialized separately and never runs
+        # while the state lock is held.
+        self._refresh_lock = threading.Lock()
         self._proxy_pass = (proxy_pass or "").strip() or None
+        self._proxy_pass_explicit = bool(self._proxy_pass)
         self._fxa_token = (fxa_token or "").strip() or None
+        self._fxa_token_explicit = bool(self._fxa_token)
+        self._fxa_token_from_file = False
         self.guardian = guardian.rstrip("/")
-        self.rotate_skew = rotate_skew
+        self.rotate_skew = max(0, int(rotate_skew))
+        self.usable_skew = max(0, int(usable_skew))
         self.last_error: str | None = None
-        self.last_refresh: float | None = None
-        self.last_status: int | None = None
         self.usage_headers: dict[str, str] = {}
         self.quota = ProxyUsage()
-        self.retry_at: float | None = None
         self._refreshing = False
-        self._proxy_file = TOKENS / "proxy_pass.jwt"
-        self._fxa_file = TOKENS / "fxa_token.txt"
-        self._proxy_mtime = 0.0
+        token_root = token_dir or TOKENS
+        self._proxy_file = token_root / "proxy_pass.jwt"
+        self._rejected_file = token_root / "rejected_proxy_pass.sha256"
+        self._fxa_file = token_root / "fxa_token.txt"
+        self._session_file = token_root / "session_token.txt"
+        self._account_meta_file = token_root / "account_meta.json"
+        self._refresh_state_file = refresh_state_file or token_root / "refresh_state.json"
+        self._rejected_token_digests = self._load_rejected_digests()
+        self._proxy_marker: tuple[int, int, int] | None = self._file_marker(self._proxy_file)
+        self.refresh_state = load_refresh_state(self._refresh_state_file)
+        self.last_refresh = self.refresh_state.get("last_success_at")
+        self.last_status = self.refresh_state.get("http_status")
+        self.retry_at = self.refresh_state.get("next_attempt_at")
         if self._proxy_pass:
             try:
                 validate_proxy_pass_jwt(self._proxy_pass, guardian=self.guardian)
             except ValueError:
                 self.last_error = "ignored malformed ProxyPass JWT provided in configuration"
                 self._proxy_pass = None
-        self._reload_from_disk(force=True)
+            else:
+                if self._is_rejected_unlocked(self._proxy_pass):
+                    self.last_error = "ignored a previously rejected ProxyPass JWT"
+                    self._proxy_pass = None
+        # An explicit CLI/environment token wins at startup.  Record the
+        # current file marker so only a later atomic refresh may replace it.
+        self._reload_from_disk(force=not self._proxy_pass_explicit)
 
-    def _file_mtime(self, path: Path) -> float:
+    @staticmethod
+    def _token_digest(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _is_rejected_unlocked(self, token: str | None) -> bool:
+        return bool(token) and self._token_digest(token) in self._rejected_token_digests
+
+    def _load_rejected_digests(self) -> list[str]:
         try:
-            return path.stat().st_mtime
+            values = self._rejected_file.read_text(encoding="ascii").splitlines()
+        except (FileNotFoundError, OSError, UnicodeDecodeError):
+            return []
+        return [
+            value.lower()
+            for value in values[-32:]
+            if re.fullmatch(r"[0-9a-fA-F]{64}", value)
+        ]
+
+    def _persist_rejected_digests_unlocked(self) -> None:
+        atomic_write_text(
+            self._rejected_file,
+            "".join(f"{digest}\n" for digest in self._rejected_token_digests),
+            mode=0o600,
+        )
+
+    def _clear_rejected_digests_unlocked(self) -> None:
+        self._rejected_token_digests.clear()
+        try:
+            self._rejected_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            self.last_error = f"could not clear rejected ProxyPass marker: {type(exc).__name__}"
+
+    def _mark_rejected_unlocked(self, token: str) -> None:
+        digest = self._token_digest(token)
+        added = False
+        if digest not in self._rejected_token_digests:
+            self._rejected_token_digests.append(digest)
+            del self._rejected_token_digests[:-32]
+            added = True
+        if self._proxy_pass and hmac.compare_digest(self._proxy_pass, token):
+            self._proxy_pass = None
+        if added:
+            self._persist_rejected_digests_unlocked()
+
+    def _file_marker(self, path: Path) -> tuple[int, int, int] | None:
+        try:
+            stat_result = path.stat()
+            return (stat_result.st_ino, stat_result.st_mtime_ns, stat_result.st_size)
         except OSError:
-            return 0.0
+            return None
 
     def _reload_from_disk(self, force: bool = False) -> None:
-        m = self._file_mtime(self._proxy_file)
-        if force or m > self._proxy_mtime:
-            pp = load_token_file(self._proxy_file)
-            if pp:
+        for digest in self._load_rejected_digests():
+            if digest not in self._rejected_token_digests:
+                self._rejected_token_digests.append(digest)
+        del self._rejected_token_digests[:-32]
+        if self._proxy_pass and self._is_rejected_unlocked(self._proxy_pass):
+            self._proxy_pass = None
+        marker = self._file_marker(self._proxy_file)
+        if force or marker != self._proxy_marker:
+            proxy_pass = load_token_file(self._proxy_file)
+            if proxy_pass and not self._is_rejected_unlocked(proxy_pass):
                 try:
-                    validate_proxy_pass_jwt(pp, guardian=self.guardian)
+                    validate_proxy_pass_jwt(proxy_pass, guardian=self.guardian)
                 except ValueError:
                     self.last_error = "ignored malformed ProxyPass JWT on disk"
                 else:
-                    self._proxy_pass = pp
-            self._proxy_mtime = m
-        fx = load_token_file(self._fxa_file)
-        if fx:
-            self._fxa_token = fx
+                    self._proxy_pass = proxy_pass
+            self._proxy_marker = marker
+        if not self._fxa_token_explicit:
+            fxa_token = load_token_file(self._fxa_file)
+            if fxa_token:
+                self._fxa_token = fxa_token
+                self._fxa_token_from_file = True
+            elif self._fxa_token_from_file:
+                self._fxa_token = None
+                self._fxa_token_from_file = False
 
-    def current(self) -> str | None:
+    def _session_refresh_available(self) -> bool:
+        helper = ROOT / "refresh_tokens.py"
+        return helper.exists() and bool(
+            load_token_file(self._session_file) or self._account_meta_file.exists()
+        )
+
+    def _automatic_renewal_ready(self) -> bool:
+        session_token = load_token_file(self._session_file)
+        try:
+            metadata = json.loads(self._account_meta_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(metadata, dict):
+            return False
+        return bool(
+            session_token
+            and str(metadata.get("email") or "").strip()
+            and str(metadata.get("uid") or "").strip()
+        )
+
+    def _sync_refresh_state(self) -> dict:
+        """Reload non-secret renewal state written by another process."""
+        state = load_refresh_state(self._refresh_state_file)
+        with self._lock:
+            previous_retry = self.retry_at
+            self.refresh_state = state
+            self.last_refresh = state.get("last_success_at")
+            self.last_status = state.get("http_status")
+            persisted_retry = state.get("next_attempt_at")
+            if (
+                persisted_retry is None
+                and state.get("result") in {"never", "in_progress"}
+                and isinstance(previous_retry, (int, float))
+                and previous_retry > time.time()
+            ):
+                self.retry_at = previous_retry
+            else:
+                self.retry_at = persisted_retry
+        return state
+
+    def _renewal_block_unlocked(self) -> tuple[str, float | None] | None:
+        result = self.refresh_state.get("result")
+        if result not in RENEWAL_BLOCK_RESULTS:
+            return None
+        next_attempt = self.refresh_state.get("next_attempt_at")
+        deadline = (
+            float(next_attempt)
+            if isinstance(next_attempt, (int, float)) and not isinstance(next_attempt, bool)
+            else None
+        )
+        return str(result), deadline
+
+    def _usable_unlocked(self, token: str | None = None) -> bool:
+        candidate = self._proxy_pass if token is None else token
+        if not candidate or self._is_rejected_unlocked(candidate):
+            return False
+        try:
+            validate_proxy_pass_jwt(
+                candidate,
+                guardian=self.guardian,
+                min_ttl=self.usable_skew,
+            )
+            return True
+        except Exception:
+            return False
+
+    def is_usable(self) -> bool:
         with self._lock:
             self._reload_from_disk()
-            return self._proxy_pass
+            return self._usable_unlocked()
 
-    def needs_refresh(self) -> bool:
-        with self._lock:
-            self._reload_from_disk()
-            if not self._proxy_pass:
-                return True
-            return self.needs_refresh_unlocked()
-
-    def ensure(self) -> str:
-        with self._lock:
-            self._reload_from_disk()
-            if self._proxy_pass and not self.needs_refresh_unlocked():
-                return self._proxy_pass
-            self._refresh_locked()
-            if not self._proxy_pass or self.needs_refresh_unlocked():
-                raise RuntimeError(
-                    self.last_error
-                    or "no ProxyPass JWT; run refresh_tokens.py or set tokens/proxy_pass.jwt"
-                )
-            return self._proxy_pass
-
-    def needs_refresh_unlocked(self) -> bool:
-        if not self._proxy_pass:
+    def should_refresh_unlocked(self) -> bool:
+        renewal_block = self._renewal_block_unlocked()
+        if renewal_block is not None:
+            _, next_attempt = renewal_block
+            return next_attempt is None or next_attempt <= time.time()
+        if not self._proxy_pass or self._is_rejected_unlocked(self._proxy_pass):
             return True
         try:
             validate_proxy_pass_jwt(
@@ -626,155 +800,518 @@ class TokenStore:
         except Exception:
             return True
 
-    def refresh(self) -> str:
+    # Backward-compatible name used by existing callers.
+    def needs_refresh_unlocked(self) -> bool:
+        return self.should_refresh_unlocked()
+
+    def should_refresh(self) -> bool:
+        self._sync_refresh_state()
         with self._lock:
-            self._refresh_locked()
-            if not self._proxy_pass or self.needs_refresh_unlocked():
-                raise RuntimeError(self.last_error or "refresh failed")
+            self._reload_from_disk()
+            return self.should_refresh_unlocked()
+
+    def needs_refresh(self) -> bool:
+        return self.should_refresh()
+
+    def current(self) -> str | None:
+        with self._lock:
+            self._reload_from_disk()
             return self._proxy_pass
 
-    def _refresh_locked(self) -> None:
-        if self._refreshing:
-            return
-        self._refreshing = True
-        try:
-            if self.retry_at and time.time() < self.retry_at:
-                wait = max(1, int(self.retry_at - time.time()))
-                self.last_error = f"Guardian refresh is rate-limited; retry in {wait}s"
-                return
-            self._reload_from_disk(force=True)
-            # Another process may have refreshed already
-            if self._proxy_pass and not self.needs_refresh_unlocked():
-                self.last_error = None
-                return
-            helper = ROOT / "refresh_tokens.py"
-            if helper.exists() and (
-                load_token_file(TOKENS / "session_token.txt") or (TOKENS / "account_meta.json").exists()
-            ):
-                try:
-                    subprocess.check_call(
-                        [sys.executable, str(helper)],
-                        cwd=str(ROOT),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=90,
+    def ensure(self) -> str:
+        # A still-usable last-good is returned immediately. Proactive renewal
+        # belongs to the background worker and must not add minutes of latency
+        # to a proxy request.
+        self._sync_refresh_state()
+        recover_blocked_state = False
+        with self._lock:
+            self._reload_from_disk()
+            renewal_block = self._renewal_block_unlocked()
+            if renewal_block is not None:
+                result, next_attempt = renewal_block
+                now = time.time()
+                if next_attempt is not None and next_attempt > now:
+                    wait = max(1, int(next_attempt - now))
+                    raise RuntimeError(
+                        f"automatic renewal is paused ({result}); retry in {wait}s"
                     )
-                    self._reload_from_disk(force=True)
-                    if self._proxy_pass and not self.needs_refresh_unlocked():
-                        self.last_refresh = time.time()
-                        self.last_error = None
-                        return
-                    self.last_error = "refresh_tokens.py did not produce a valid fresh ProxyPass JWT"
-                except Exception as e:
-                    self.last_error = f"refresh_tokens.py failed: {e}"
-            # Fallback: Guardian with current FxA access token
-            if not self._fxa_token:
-                if not self.last_error:
-                    self.last_error = "missing FxA token / session"
-                return
-            url = f"{self.guardian}/api/v1/fpn/token"
-            req = urllib.request.Request(
-                url,
-                headers=guardian_headers(self._fxa_token),
-                method="GET",
+                recover_blocked_state = True
+            elif self._usable_unlocked():
+                return self._proxy_pass or ""
+        try:
+            return self.refresh(force=recover_blocked_state)
+        except Exception as exc:
+            self._sync_refresh_state()
+            with self._lock:
+                self._reload_from_disk()
+                if self._renewal_block_unlocked() is None and self._usable_unlocked():
+                    return self._proxy_pass or ""
+                message = self.last_error or str(exc)
+            raise RuntimeError(
+                message or "no ProxyPass JWT; run refresh_tokens.py or set tokens/proxy_pass.jwt"
+            ) from exc
+
+    def _record_state(
+        self,
+        result: str,
+        *,
+        http_status: int | None = None,
+        next_attempt_at: float | None = None,
+        proxy_pass_expires_at: float | None = None,
+    ) -> None:
+        try:
+            state = record_refresh_state(
+                self._refresh_state_file,
+                result,
+                http_status=http_status,
+                next_attempt_at=next_attempt_at,
+                proxy_pass_expires_at=proxy_pass_expires_at,
             )
-            for attempt in range(3):
-                try:
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        self.last_status = getattr(resp, "status", 200)
-                        try:
-                            self._set_usage(resp.headers, require_quota=True)
-                        except ValueError as quota_error:
-                            # Firefox also keeps a valid pass when quota
-                            # headers are malformed, but discards the usage.
-                            self.quota = ProxyUsage()
-                            warnings.warn(f"invalid Guardian quota headers ignored: {quota_error}")
-                        data = json.loads(resp.read().decode("utf-8"))
-                        token = data.get("token") if isinstance(data, dict) else None
-                        if not isinstance(token, str):
-                            raise ValueError("no token in Guardian response")
-                        validate_proxy_pass_jwt(
-                            token,
-                            guardian=self.guardian,
-                            min_ttl=self.rotate_skew,
-                        )
-                        atomic_write_text(self._proxy_file, token + "\n", mode=0o600)
-                        self._proxy_pass = token
-                        self._proxy_mtime = self._file_mtime(self._proxy_file)
-                        self.last_refresh = time.time()
-                        self.last_error = None
-                        self.retry_at = None
-                        return
-                except urllib.error.HTTPError as exc:
-                    self.last_status = exc.code
-                    self._set_usage(exc.headers, require_quota=False)
-                    if exc.code == 429:
-                        delay = self.quota.retry_after or 60
-                        self.retry_at = time.time() + delay
-                        self.last_error = f"Guardian quota exhausted (HTTP 429); retry in {delay}s"
-                        return
-                    if 500 <= exc.code < 600 and attempt < 2:
-                        time.sleep(0.5 * (2**attempt))
-                        continue
-                    self.last_error = f"Guardian token request failed with HTTP {exc.code}"
-                    return
-                except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                    if attempt < 2:
-                        time.sleep(0.5 * (2**attempt))
-                        continue
-                    self.last_error = f"Guardian token request failed: {type(exc).__name__}"
-                    return
-                except (ValueError, json.JSONDecodeError) as exc:
-                    self.last_error = f"invalid Guardian token response: {exc}"
-                    return
-        finally:
-            self._refreshing = False
+        except OSError:
+            return
+        with self._lock:
+            self.refresh_state = state
+            self.last_refresh = state.get("last_success_at")
+            self.last_status = state.get("http_status")
+            self.retry_at = state.get("next_attempt_at")
+
+    def _record_failure(
+        self,
+        result: str,
+        message: str,
+        *,
+        http_status: int | None = None,
+        delay: float | None = None,
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            failures = int(self.refresh_state.get("consecutive_failures") or 0)
+        cooldown = retry_delay(failures) if delay is None else max(1.0, float(delay))
+        next_attempt = now + cooldown
+        with self._lock:
+            self.last_error = message
+            self.last_status = http_status
+            self.retry_at = next_attempt
+        self._record_state(
+            result,
+            http_status=http_status,
+            next_attempt_at=next_attempt,
+        )
+
+    def _accept_token(
+        self,
+        token: str,
+        *,
+        persist: bool,
+        record_success: bool = True,
+    ) -> str:
+        claims = validate_proxy_pass_jwt(
+            token,
+            guardian=self.guardian,
+            min_ttl=self.rotate_skew,
+        )
+        if self._token_digest(token) in self._rejected_token_digests:
+            raise ValueError("Guardian returned a previously rejected ProxyPass JWT")
+        if persist:
+            atomic_write_text(self._proxy_file, token + "\n", mode=0o600)
+        now = time.time()
+        with self._lock:
+            self._proxy_pass = token
+            self._proxy_marker = self._file_marker(self._proxy_file)
+            self.last_refresh = now
+            self.last_error = None
+            self.retry_at = None
+            self._clear_rejected_digests_unlocked()
+        if record_success:
+            self._record_state(
+                "success",
+                http_status=self.last_status,
+                proxy_pass_expires_at=float(claims["exp"]),
+            )
+        return token
+
+    def _adopt_helper_state(self) -> bool:
+        state = load_refresh_state(self._refresh_state_file)
+        if state.get("result") in {"never", "in_progress"}:
+            return False
+        with self._lock:
+            self.refresh_state = state
+            self.last_refresh = state.get("last_success_at")
+            self.last_status = state.get("http_status")
+            self.retry_at = state.get("next_attempt_at")
+            self.last_error = f"refresh helper result: {state.get('result')}"
+        return True
+
+    def _refresh_via_helper(self, *, force: bool) -> str | None:
+        helper = ROOT / "refresh_tokens.py"
+        command = [sys.executable, str(helper)]
+        if force:
+            command.append("--force")
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(ROOT),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=REFRESH_HELPER_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._record_failure(
+                "transient_error",
+                f"refresh_tokens.py failed: {type(exc).__name__}",
+            )
+            return None
+        if completed.returncode == 75:
+            if self._adopt_helper_state():
+                return None
+            # Do not persist a competing "busy" result. The lock owner may
+            # be about to write a longer Guardian Retry-After; overwriting it
+            # here would re-enable requests too early. Keep only a short local
+            # wait and let the owner publish the authoritative state.
+            with self._lock:
+                self.last_error = "another token refresh is in progress"
+                self.retry_at = time.time() + 5
+            return None
+        if completed.returncode != 0:
+            if self._adopt_helper_state():
+                return None
+            self._record_failure(
+                "transient_error",
+                f"refresh_tokens.py failed with status {completed.returncode}",
+            )
+            return None
+        candidate = load_token_file(self._proxy_file)
+        if candidate:
+            try:
+                helper_recorded_success = self._adopt_helper_state() and (
+                    self.refresh_state.get("result") == "success"
+                )
+                token = self._accept_token(
+                    candidate,
+                    persist=False,
+                    record_success=not helper_recorded_success,
+                )
+                with self._lock:
+                    self.last_error = None
+                return token
+            except ValueError:
+                pass
+        self._record_failure(
+            "protocol_error",
+            "refresh_tokens.py did not produce a valid fresh ProxyPass JWT",
+        )
+        return None
 
     def _set_usage(self, headers, *, require_quota: bool) -> None:
-        self.usage_headers = {
+        selected = {
             k: v
             for k, v in (headers.items() if headers else [])
             if k.lower().startswith("x-quota") or k.lower() == "retry-after"
         }
-        self.quota = ProxyUsage.from_headers(headers, require_quota=require_quota)
+        quota = ProxyUsage.from_headers(headers, require_quota=require_quota)
+        with self._lock:
+            self.usage_headers = selected
+            self.quota = quota
+
+    def _refresh_direct(self, fxa_token: str) -> str | None:
+        request = urllib.request.Request(
+            f"{self.guardian}/api/v1/fpn/token",
+            headers=guardian_headers(fxa_token),
+            method="GET",
+        )
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    status = getattr(response, "status", 200)
+                    with self._lock:
+                        self.last_status = status
+                    try:
+                        self._set_usage(response.headers, require_quota=True)
+                    except ValueError as quota_error:
+                        with self._lock:
+                            self.quota = ProxyUsage()
+                        warnings.warn(f"invalid Guardian quota headers ignored: {quota_error}")
+                    data = json.loads(response.read().decode("utf-8"))
+                    token = data.get("token") if isinstance(data, dict) else None
+                    if not isinstance(token, str):
+                        raise ValueError("no token in Guardian response")
+                    return self._accept_token(token, persist=True)
+            except urllib.error.HTTPError as exc:
+                retry_after = _retry_after_seconds(
+                    exc.headers.get("Retry-After") if exc.headers else None
+                )
+                quota_reset = _quota_reset_seconds(
+                    exc.headers.get("X-Quota-Reset") if exc.headers else None
+                )
+                with self._lock:
+                    self.last_status = exc.code
+                try:
+                    self._set_usage(exc.headers, require_quota=False)
+                except ValueError as quota_error:
+                    with self._lock:
+                        self.quota = ProxyUsage(retry_after=retry_after)
+                    warnings.warn(f"invalid Guardian quota headers ignored: {quota_error}")
+                if exc.code == 429:
+                    delay = next(
+                        (
+                            max(1, candidate)
+                            for candidate in (retry_after, quota_reset)
+                            if candidate is not None
+                        ),
+                        None,
+                    )
+                    self._record_failure(
+                        "rate_limited",
+                        "Guardian quota exhausted (HTTP 429); cooldown scheduled",
+                        http_status=429,
+                        delay=delay,
+                    )
+                    return None
+                if exc.code in {401, 403}:
+                    result = "reauth_required" if exc.code == 401 else "no_entitlement"
+                    self._record_failure(
+                        result,
+                        f"Guardian token request failed with HTTP {exc.code}",
+                        http_status=exc.code,
+                        delay=60,
+                    )
+                    return None
+                if 500 <= exc.code < 600 and retry_after is not None:
+                    self._record_failure(
+                        "transient_error",
+                        f"Guardian token request failed with HTTP {exc.code}",
+                        http_status=exc.code,
+                        delay=max(1, retry_after),
+                    )
+                    return None
+                if 500 <= exc.code < 600 and attempt < 2:
+                    time.sleep(0.5 * (2**attempt))
+                    continue
+                self._record_failure(
+                    "transient_error",
+                    f"Guardian token request failed with HTTP {exc.code}",
+                    http_status=exc.code,
+                )
+                return None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < 2:
+                    time.sleep(0.5 * (2**attempt))
+                    continue
+                self._record_failure(
+                    "transient_error",
+                    f"Guardian token request failed: {type(exc).__name__}",
+                )
+                return None
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._record_failure(
+                    "protocol_error",
+                    f"invalid Guardian token response: {exc}",
+                )
+                return None
+        return None
+
+    def refresh(
+        self,
+        force: bool = False,
+        rejected_token: str | None = None,
+    ) -> str:
+        rejected = (rejected_token or "").strip() or None
+        with self._lock:
+            self._reload_from_disk()
+            observed = self._proxy_pass
+            if rejected:
+                self._mark_rejected_unlocked(rejected)
+        with self._refresh_lock:
+            # A cron job or another service process may have written a
+            # cooldown after this TokenStore was created.  Refresh the
+            # non-secret state before making any network decision so a
+            # restart or cross-process race cannot erase Retry-After.
+            persisted_state = self._sync_refresh_state()
+            with self._lock:
+                self._reload_from_disk()
+                if rejected:
+                    self._mark_rejected_unlocked(rejected)
+                    if self._usable_unlocked():
+                        replacement = self._proxy_pass or ""
+                        if replacement and not hmac.compare_digest(replacement, rejected):
+                            self._clear_rejected_digests_unlocked()
+                        return replacement
+                elif force and observed is not None and self._proxy_pass != observed and self._usable_unlocked():
+                    return self._proxy_pass or ""
+                elif (
+                    not force
+                    and self._renewal_block_unlocked() is None
+                    and not self.should_refresh_unlocked()
+                ):
+                    return self._proxy_pass or ""
+                now = time.time()
+                next_attempt = self.refresh_state.get("next_attempt_at") or self.retry_at
+                if isinstance(next_attempt, (int, float)) and next_attempt > now:
+                    wait = max(1, int(next_attempt - now))
+                    self.last_error = f"Guardian refresh is in backoff; retry in {wait}s"
+                    raise RuntimeError(self.last_error)
+                recovering_blocked_state = self._renewal_block_unlocked() is not None
+                self._refreshing = True
+                fxa_token = self._fxa_token
+                force_helper = (
+                    force
+                    or bool(rejected)
+                    or bool(self._rejected_token_digests)
+                    or recovering_blocked_state
+                )
+
+            session_refresh = self._session_refresh_available()
+            # The helper owns the cross-process lock and records its own
+            # in-progress state.  Writing that state here could race a helper
+            # that has just persisted a cooldown and accidentally clear it.
+            if not session_refresh:
+                self._record_state("in_progress", next_attempt_at=None)
+            try:
+                if session_refresh:
+                    token = self._refresh_via_helper(force=force_helper)
+                elif fxa_token:
+                    token = self._refresh_direct(fxa_token)
+                else:
+                    self._record_failure(
+                        "missing_credentials",
+                        "missing FxA token / session",
+                        delay=60,
+                    )
+                    token = None
+            except Exception as exc:
+                self._record_failure(
+                    "transient_error",
+                    f"token refresh failed: {type(exc).__name__}",
+                )
+                token = None
+            finally:
+                with self._lock:
+                    self._refreshing = False
+
+            if token:
+                return token
+            with self._lock:
+                error = self.last_error or "refresh failed"
+            raise RuntimeError(error)
 
     def usage(self) -> ProxyUsage:
-        if not self._fxa_token:
+        with self._lock:
+            fxa_token = self._fxa_token
+        if not fxa_token:
             raise RuntimeError("missing FxA access token for Guardian usage query")
         req = urllib.request.Request(
             f"{self.guardian}/api/v1/fpn/token",
-            headers=guardian_headers(self._fxa_token),
+            headers=guardian_headers(fxa_token),
             method="HEAD",
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                self.last_status = getattr(resp, "status", 200)
+                with self._lock:
+                    self.last_status = getattr(resp, "status", 200)
                 self._set_usage(resp.headers, require_quota=True)
         except urllib.error.HTTPError as exc:
-            self.last_status = exc.code
-            self._set_usage(exc.headers, require_quota=False)
+            retry_after = _retry_after_seconds(
+                exc.headers.get("Retry-After") if exc.headers else None
+            )
+            quota_reset = _quota_reset_seconds(
+                exc.headers.get("X-Quota-Reset") if exc.headers else None
+            )
+            with self._lock:
+                self.last_status = exc.code
+            try:
+                self._set_usage(exc.headers, require_quota=False)
+            except ValueError:
+                with self._lock:
+                    self.quota = ProxyUsage(retry_after=retry_after)
             if exc.code == 429:
-                delay = self.quota.retry_after or 60
-                self.retry_at = time.time() + delay
+                delay = next(
+                    (
+                        max(1, candidate)
+                        for candidate in (retry_after, quota_reset)
+                        if candidate is not None
+                    ),
+                    None,
+                )
+                self._record_failure(
+                    "rate_limited",
+                    "Guardian usage request was rate-limited",
+                    http_status=429,
+                    delay=delay,
+                )
             raise RuntimeError(f"Guardian usage request failed with HTTP {exc.code}") from exc
-        return self.quota
+        with self._lock:
+            return self.quota
 
     def status(self) -> dict:
+        automatic_ready = self._automatic_renewal_ready()
+        self._sync_refresh_state()
         with self._lock:
             self._reload_from_disk()
-            pp = self._proxy_pass
+            proxy_pass = self._proxy_pass
+            summary = safe_jwt_summary(proxy_pass) if proxy_pass else None
             return {
-                "has_proxy_pass": bool(pp),
+                "has_proxy_pass": bool(proxy_pass),
                 "has_fxa_token": bool(self._fxa_token),
-                "proxy_pass": jwt_summary(pp) if pp else None,
+                "automatic_renewal_ready": automatic_ready,
+                "refresh_in_progress": self._refreshing,
+                "proxy_pass": summary,
                 "last_refresh": self.last_refresh,
                 "last_status": self.last_status,
                 "last_error": self.last_error,
-                "usage_headers": self.usage_headers,
+                "usage_headers": dict(self.usage_headers),
                 "quota": asdict(self.quota),
                 "retry_at": self.retry_at,
+                "refresh_state": dict(self.refresh_state),
                 "guardian": self.guardian,
             }
+
+
+class TokenRefreshWorker:
+    """Named, testable lifecycle wrapper for proactive ProxyPass renewal."""
+
+    def __init__(
+        self,
+        tokens: TokenStore,
+        stop_event: threading.Event,
+        interval: float = 30.0,
+        logger=print,
+    ) -> None:
+        self.tokens = tokens
+        self.stop_event = stop_event
+        self.interval = max(0.01, float(interval))
+        self.logger = logger
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> "TokenRefreshWorker":
+        if self.thread is not None and self.thread.is_alive():
+            return self
+        self.thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="token-refresh-worker",
+        )
+        self.thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                if self.tokens.should_refresh():
+                    token = self.tokens.refresh()
+                    self.logger(f"[*] token refreshed: {json.dumps(safe_jwt_summary(token))}")
+            except Exception as exc:
+                self.logger(f"[!] token refresh error: {exc}")
+            self.stop_event.wait(self.interval)
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self.stop_event.set()
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, timeout))
+
+    def is_alive(self) -> bool:
+        return bool(self.thread and self.thread.is_alive())
 
 
 @dataclass
@@ -1335,7 +1872,7 @@ class FastlyConnectClient:
                 pass
             if _retry and status_code in {401, 403, 407}:
                 try:
-                    self.tokens.refresh()
+                    self.tokens.refresh(force=True, rejected_token=token)
                     return self.open_tunnel(
                         exit_host, exit_port, dest_host, dest_port, timeout, _retry=False
                     )
@@ -1850,8 +2387,29 @@ class Pool:
         self.rotator_http_server: ThreadedHTTPProxy | None = None
         self.rotator_socks_thread: threading.Thread | None = None
         self.rotator_http_thread: threading.Thread | None = None
+        self.refresh_worker: TokenRefreshWorker | None = None
         self._lifecycle_lock = threading.RLock()
         self._stop = threading.Event()
+
+    def start_refresh_worker(
+        self,
+        interval: float = 30.0,
+        logger=print,
+    ) -> TokenRefreshWorker:
+        with self._lifecycle_lock:
+            if self.refresh_worker is not None:
+                raise RuntimeError("token refresh worker is already running")
+            if self._stop.is_set():
+                raise RuntimeError("cannot start token refresh worker after pool shutdown")
+            worker = TokenRefreshWorker(
+                self.tokens,
+                self._stop,
+                interval=interval,
+                logger=logger,
+            )
+            self.refresh_worker = worker
+            worker.start()
+            return worker
 
     def _start(
         self,
@@ -2180,6 +2738,8 @@ class Pool:
     def stop(self) -> None:
         with self._lifecycle_lock:
             self._stop.set()
+            refresh_worker = self.refresh_worker
+            self.refresh_worker = None
             # Stop front doors first so no new request can race backend
             # teardown. Clear references before closing for idempotence.
             rotators = [
@@ -2196,6 +2756,8 @@ class Pool:
             self.rotator_http_mode = None
             running = self.running
             self.running = []
+        if refresh_worker is not None:
+            refresh_worker.stop()
         for srv, thread in rotators:
             self._close_server(srv, thread)
         for rn in running:
@@ -2237,7 +2799,6 @@ def build_tokens(args: argparse.Namespace) -> TokenStore:
     fxa = (
         args.fxa_token
         or os.environ.get("IPP_FXA_TOKEN")
-        or load_token_file(TOKENS / "fxa_token.txt")
     )
     return TokenStore(proxy_pass=proxy_pass, fxa_token=fxa, guardian=args.guardian)
 
@@ -2284,20 +2845,20 @@ def cmd_how_to_token(args: argparse.Namespace) -> int:
     """Print a read-only token acquisition guide without exposing credentials."""
     del args
     print(
-        """ProxyPass token guide (read-only)
+        """ProxyPass 凭据说明（本命令不会读取本地凭据）
 
-1. Sign in to Firefox and enable IP Protection for an account that has access.
-2. Inspect your own browser's network request to:
-   https://vpn.mozilla.org/api/v1/fpn/token
-3. Save only the JSON response's token value to tokens/proxy_pass.jwt with mode 0600.
-4. Check it locally:
-   python3 ipp_pool.py token-status
-5. For automatic renewal, provide the FxA session files and run:
-   python3 refresh_tokens.py
+长期运行请不要手工抓取或定期替换 ProxyPass JWT。推荐流程：
+1. 安装 requirements-bootstrap.txt 和 Playwright Firefox。
+2. 运行：python3 login_and_bootstrap.py --email you@example.com
+3. 在终端完成一次密码、邮箱验证码和可能的 CAPTCHA 交互。
+4. 强制验收：python3 refresh_tokens.py --force
+5. 检查：python3 ipp_pool.py token-status
+6. 常驻运行 ipp_pool.py run；后台 worker 会自动长期续期，无需 cron。
 
-The ProxyPass JWT is short-lived. Do not paste it into logs, shell history,
-issue trackers, or public endpoint lists. This command never reads or prints
-the local token files.
+只有临时调试时，才从你自己的 Guardian /api/v1/fpn/token 响应中取出
+token 并以 0600 保存到 tokens/proxy_pass.jwt。单独的 ProxyPass 很快到期，
+不能用于无人值守部署。不要把 JWT、session、密码或验证码粘贴到日志、
+shell 历史、issue 或公共节点列表中。
 """
     )
     return 0
@@ -2306,7 +2867,7 @@ the local token files.
 def cmd_token_refresh(args: argparse.Namespace) -> int:
     ts = build_tokens(args)
     try:
-        tok = ts.refresh()
+        tok = ts.refresh(force=bool(getattr(args, "force", False)))
     except Exception as e:
         print(f"[!] {e}", file=sys.stderr)
         return 1
@@ -2403,7 +2964,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"[!] token: {e}", file=sys.stderr)
         return 1
-    print(f"[*] proxy_pass: {json.dumps(jwt_summary(token))}")
+    print(f"[*] proxy_pass: {json.dumps(safe_jwt_summary(token))}")
     try:
         out = probe_node(node, FastlyConnectClient(ts))
     except Exception as e:
@@ -2504,7 +3065,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     ts = build_tokens(args)
     try:
         tok = ts.ensure()
-        print(f"[*] proxy_pass: {json.dumps(jwt_summary(tok))}")
+        print(f"[*] proxy_pass: {json.dumps(safe_jwt_summary(tok))}")
     except Exception as e:
         print(f"[!] token not ready: {e}", file=sys.stderr)
         if not args.allow_no_token:
@@ -2540,17 +3101,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if http_rotator_host is not None:
         pool.start_http_rotator(http_rotator_listen, mode=args.rotate_mode)
 
-    def refresher() -> None:
-        while not pool._stop.is_set():  # noqa: SLF001
-            try:
-                if ts.needs_refresh():
-                    ts.refresh()
-                    print(f"[*] token refreshed: {json.dumps(jwt_summary(ts.current() or ''))}")
-            except Exception as e:
-                print(f"[!] token refresh error: {e}")
-            pool._stop.wait(30)  # noqa: SLF001
-
-    threading.Thread(target=refresher, daemon=True).start()
+    pool.start_refresh_worker()
 
     print("[*] pool running. Ctrl+C / SIGTERM to stop.")
     print(f"    public host: {public_ip}")
@@ -2622,6 +3173,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("token-refresh")
     add_common(s)
+    s.add_argument(
+        "--force",
+        action="store_true",
+        help="request a new ProxyPass even when the current pass is still fresh",
+    )
     s.set_defaults(func=cmd_token_refresh)
 
     s = sub.add_parser("usage")

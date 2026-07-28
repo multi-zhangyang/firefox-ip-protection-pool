@@ -113,7 +113,16 @@ class ProbeDefaultSelectionTests(unittest.TestCase):
             patch.object(ipp_pool, "build_tokens", return_value=token_store),
             patch.object(ipp_pool, "fetch_serverlist", return_value=self.nodes),
             patch.object(ipp_pool.random, "choice", side_effect=fair_choice),
-            patch.object(ipp_pool, "jwt_summary", return_value={"valid": True}),
+            patch.object(
+                ipp_pool,
+                "jwt_summary",
+                side_effect=AssertionError("raw JWT summary must not be logged"),
+            ),
+            patch.object(
+                ipp_pool,
+                "safe_jwt_summary",
+                return_value={"valid": True},
+            ) as safe_summary,
             patch.object(ipp_pool, "probe_node", return_value='{"country":"ZZ"}') as probe,
             patch.object(ipp_pool.subprocess, "check_output") as child_process,
             redirect_stdout(io.StringIO()),
@@ -124,6 +133,7 @@ class ProbeDefaultSelectionTests(unittest.TestCase):
 
         self.assertEqual(country_choices, [["DE", "US"], ["DE", "US"]])
         self.assertEqual(probe.call_count, 2)
+        self.assertEqual(safe_summary.call_count, 2)
         child_process.assert_not_called()
 
 

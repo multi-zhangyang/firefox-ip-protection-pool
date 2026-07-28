@@ -170,7 +170,16 @@ class RunListenerStartupTests(unittest.TestCase):
             patch.object(ipp_pool, "build_tokens", return_value=token_store),
             patch.object(ipp_pool, "fetch_serverlist", return_value=[object()]),
             patch.object(ipp_pool, "parse_listen_auth_file", auth_file),
-            patch.object(ipp_pool, "jwt_summary", return_value={"valid": True}),
+            patch.object(
+                ipp_pool,
+                "jwt_summary",
+                side_effect=AssertionError("raw JWT summary must not be logged"),
+            ),
+            patch.object(
+                ipp_pool,
+                "safe_jwt_summary",
+                return_value={"valid": True},
+            ),
             patch.object(ipp_pool, "Pool", pool_factory),
             redirect_stdout(io.StringIO()),
             redirect_stderr(io.StringIO()),

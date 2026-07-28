@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Bootstrap long-lived FxA/IP-Protection auth on this VPS.
+"""Interactively bootstrap long-lived FxA/IP-Protection credentials.
 
 Flow:
 1) Pass Fastly challenge on accounts.firefox.com (POW + vision captcha)
 2) Sign in with email/password
-3) Submit email 6-digit code (CLI arg or tokens/email_code.txt)
+3) Read and submit the 6-digit email code interactively when requested
 4) Exchange session -> OAuth access token (profile + vpn scopes)
-5) Activate Guardian if needed, fetch ProxyPass JWT
-6) Save tokens for ipp_pool.py auto-refresh
+5) Activate Guardian only when status explicitly reports not registered (404)
+6) Fetch an initial ProxyPass, destroy the short-lived OAuth token, and save
+   only the FxA session material required by refresh_tokens.py
 
 Usage:
   . .venv/bin/activate
-  python login_and_bootstrap.py --email you@example.com --password '...' --code 123456
-  # or after code arrives:
-  python login_and_bootstrap.py --email you@example.com --password '...' --wait-code-file
+  python login_and_bootstrap.py --email you@example.com
+
+The password and email verification code are read from the terminal. They are
+not accepted through command-line options or environment variables.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import hashlib
 import itertools
 import json
@@ -35,14 +38,16 @@ from urllib.parse import urlsplit
 import requests
 from fxa.core import Session as FxSession, StretchedPassword
 from fxa.oauth import Client as OAuthClient
-from fxa._utils import APIClient
-from playwright.sync_api import sync_playwright
 
+from refresh_state import record_refresh_state
 from refresh_tokens import (
     ProxyPassValidationError,
+    ROTATE_BEFORE_SECONDS,
     _retry_after_seconds,
     atomic_write_text,
+    bounded_fxa_api_client,
     guardian_request,
+    refresh_lock,
     validate_proxy_pass_jwt,
 )
 
@@ -54,31 +59,9 @@ for p in (TOKENS, DATA, LOGS):
     p.mkdir(exist_ok=True)
 
 FX_CLIENT_ID = "5882386c6d801776"
-VPN_CLIENT_ID = "e6eb0d1e856335fc"
 SCOPES = "profile https://identity.mozilla.com/apps/vpn"
 GUARDIAN = "https://vpn.mozilla.org"
 ALPH = string.ascii_letters + string.digits
-
-
-def atomic_write_bytes(path: Path, content: bytes, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        os.fchmod(fd, mode)
-        with os.fdopen(fd, "wb") as tmp:
-            fd = -1
-            tmp.write(content)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        os.replace(tmp_name, path)
-    except Exception:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def safe_page_location(url: str) -> str:
@@ -86,8 +69,59 @@ def safe_page_location(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
 
-def save_storage_state(context, path: Path) -> None:
-    atomic_write_text(path, json.dumps(context.storage_state(), separators=(",", ":")) + "\n")
+def prompt_password() -> str:
+    """Read the Firefox Account password without exposing it in argv or env."""
+    try:
+        password = getpass.getpass("Firefox Account password: ")
+    except (EOFError, OSError) as exc:
+        raise RuntimeError("an interactive terminal is required to read the password") from exc
+    if not password:
+        raise RuntimeError("password cannot be empty")
+    return password
+
+
+def prompt_email_code() -> str:
+    """Read a six-digit email verification code from the terminal."""
+    for _ in range(3):
+        try:
+            code = input("Mozilla 6-digit email code: ").strip()
+        except EOFError as exc:
+            raise RuntimeError("an interactive terminal is required to read the email code") from exc
+        if re.fullmatch(r"\d{6}", code):
+            return code
+        print("[!] email code must contain exactly 6 digits", file=sys.stderr)
+    raise RuntimeError("no valid 6-digit email code was provided")
+
+
+def cleanup_legacy_credential_cache(*, remove_browser_storage: bool = False) -> None:
+    """Remove obsolete credentials without destroying pre-bootstrap recovery data."""
+    legacy_files = (
+        TOKENS / "fxa_token.txt",
+        TOKENS / "session.json",
+        TOKENS / "email_code.txt",
+        DATA / "fxa_pending_code.json",
+        DATA / "fxa_after_code.json",
+        DATA / "fxa_logged_in.json",
+        LOGS / "bootstrap_after_password.png",
+        LOGS / "bootstrap_after_code.png",
+    )
+    if remove_browser_storage:
+        # Old versions used this full browser storage dump as a credential
+        # fallback.  Keep it until a new renewable session has been published
+        # successfully, then remove it without ever reading it.
+        legacy_files += (DATA / "ff_storage.json",)
+    for path in legacy_files:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            print(f"[!] could not remove obsolete private cache: {path.name}", file=sys.stderr)
+    for path in TOKENS.glob(".bootstrap-captcha-*.jpg"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def solve_pow(base: str, target: str) -> str:
@@ -99,11 +133,40 @@ def solve_pow(base: str, target: str) -> str:
 
 
 def vision_captcha(img: bytes) -> str:
-    api_base = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+    api_base = (
+        os.environ.get("ANTHROPIC_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or ""
+    ).rstrip("/")
     api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("OPENAI_API_KEY")
     model = os.environ.get("ANTHROPIC_MODEL") or os.environ.get("OPENAI_MODEL") or "grok-4.5"
     if not api_base or not api_key:
-        raise RuntimeError("need ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN for captcha vision")
+        fd, image_name = tempfile.mkstemp(
+            prefix=".bootstrap-captcha-",
+            suffix=".jpg",
+            dir=TOKENS,
+        )
+        image_path = Path(image_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(img)
+                handle.flush()
+                os.fsync(handle.fileno())
+            print(f"[*] CAPTCHA image saved temporarily at {image_path}")
+            answer = input("CAPTCHA characters (open the image locally if needed): ").strip()
+            answer = re.sub(r"[^A-Za-z0-9]", "", answer)
+            if not answer:
+                raise RuntimeError("CAPTCHA answer cannot be empty")
+            return answer
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                image_path.unlink()
+            except FileNotFoundError:
+                pass
     b64 = base64.b64encode(img).decode()
     r = requests.post(
         f"{api_base}/v1/chat/completions",
@@ -204,7 +267,6 @@ def pass_fastly_and_login(page, email: str, password: str) -> None:
     page.locator('input[type="password"]').first.fill(password)
     page.locator('button[type="submit"]').first.click()
     page.wait_for_timeout(6000)
-    atomic_write_bytes(LOGS / "bootstrap_after_password.png", page.screenshot(full_page=True))
     print("[*] after password:", safe_page_location(page.url))
 
 
@@ -240,7 +302,6 @@ def submit_email_code(page, code: str) -> None:
             page.click(sel)
             break
     page.wait_for_timeout(8000)
-    atomic_write_bytes(LOGS / "bootstrap_after_code.png", page.screenshot(full_page=True))
     print("[*] after code:", safe_page_location(page.url))
 
 
@@ -282,6 +343,45 @@ def api_login_with_page(page, email: str, password: str) -> dict:
     return data
 
 
+def persist_bootstrap_credentials(
+    *,
+    session_token: str,
+    email: str,
+    uid: str,
+    proxy_pass: str,
+    expires_at: float,
+    http_status: int,
+    token_dir: Path | None = None,
+) -> None:
+    """Publish a new renewable session without racing the refresh helper."""
+    # Wait only at publication time.  The interactive browser flow does not
+    # hold the lock, but any old helper must finish before this new session and
+    # success state become visible.  Later helpers see all files atomically
+    # replaced while protected by the same cross-process lock.
+    destination = TOKENS if token_dir is None else token_dir
+    with refresh_lock(destination, blocking=True):
+        atomic_write_text(destination / "session_token.txt", session_token + "\n")
+        atomic_write_text(
+            destination / "account_meta.json",
+            json.dumps({"email": email, "uid": uid}, indent=2) + "\n",
+        )
+        atomic_write_text(destination / "proxy_pass.jwt", proxy_pass + "\n")
+        # A successful interactive login supersedes proxy authorization
+        # failures associated with the former session.  Remove only the
+        # non-secret digest marker; a restarted TokenStore will then accept
+        # the freshly bootstrapped pass even if Guardian reissued the same JWT.
+        try:
+            (destination / "rejected_proxy_pass.sha256").unlink()
+        except FileNotFoundError:
+            pass
+        record_refresh_state(
+            destination / "refresh_state.json",
+            "success",
+            http_status=http_status,
+            proxy_pass_expires_at=expires_at,
+        )
+
+
 def oauth_and_proxy_pass(session_json: dict) -> None:
     session_token = session_json.get("sessionToken") or ""
     email = session_json.get("email") or ""
@@ -289,7 +389,7 @@ def oauth_and_proxy_pass(session_json: dict) -> None:
     if not email or not uid or not session_token:
         raise RuntimeError("account/login response is missing email, uid, or sessionToken")
     server = "https://api.accounts.firefox.com/v1"
-    apiclient = APIClient(server)
+    apiclient = bounded_fxa_api_client(server)
     sp = StretchedPassword(1, email, None, "x", None)
 
     class DummyClient:
@@ -307,11 +407,17 @@ def oauth_and_proxy_pass(session_json: dict) -> None:
         auth_timestamp=int(time.time() * 1000),
     )
     access = None
+    oauth_client = None
     last_err = None
-    for client_id in (FX_CLIENT_ID, VPN_CLIENT_ID):
+    # Use the same current Firefox Desktop client as refresh_tokens.py so a
+    # bootstrap success is meaningful for subsequent unattended renewal.
+    for client_id in (FX_CLIENT_ID,):
         try:
-            oauth = OAuthClient(client_id=client_id, server_url="https://oauth.accounts.firefox.com/v1")
+            oauth_server = "https://oauth.accounts.firefox.com/v1"
+            oauth = OAuthClient(client_id=client_id, server_url=oauth_server)
+            oauth.apiclient = bounded_fxa_api_client(oauth_server)
             access = oauth.authorize_token(session, scope=SCOPES, client_id=client_id)
+            oauth_client = oauth
             print(f"[+] oauth access granted via client {client_id}")
             break
         except Exception as e:
@@ -321,125 +427,151 @@ def oauth_and_proxy_pass(session_json: dict) -> None:
         kind = type(last_err).__name__ if last_err is not None else "unknown error"
         raise RuntimeError(f"oauth failed ({kind})")
 
-    # try refresh token if authorize_code path exposes it - PyFxA authorize_token may not
-    # Guardian
-    headers = {
-        "Authorization": f"Bearer {access}",
-        "Accept": "application/json",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "User-Agent": "firefox-ip-protection-pool/1.0",
-    }
-    st = guardian_request("GET", "/api/v1/fpn/status", headers=headers, label="fpn/status")
-    print("[*] fpn/status", f"HTTP {st.status_code}")
-    if st.status_code == 429 or 500 <= st.status_code <= 599:
-        retry_after = _retry_after_seconds(st.headers.get("Retry-After"))
-        suffix = f"; retry after {retry_after:g}s" if st.status_code == 429 and retry_after is not None else ""
-        raise RuntimeError(f"fpn/status failed: HTTP {st.status_code}{suffix}")
-    if st.status_code in (401, 403, 404):
-        ar = guardian_request("POST", "/api/v1/fpn/activate", headers=headers, label="fpn/activate")
-        print("[*] fpn/activate", f"HTTP {ar.status_code}")
-        if not ar.ok:
-            retry_after = _retry_after_seconds(ar.headers.get("Retry-After"))
-            suffix = f"; retry after {retry_after:g}s" if ar.status_code == 429 and retry_after is not None else ""
-            raise RuntimeError(f"fpn/activate failed: HTTP {ar.status_code}{suffix}")
-    tr = guardian_request("GET", "/api/v1/fpn/token", headers=headers, label="fpn/token")
-    print("[*] fpn/token", f"HTTP {tr.status_code}")
-    if not tr.ok:
-        retry_after = _retry_after_seconds(tr.headers.get("Retry-After"))
-        suffix = f"; retry after {retry_after:g}s" if tr.status_code == 429 and retry_after is not None else ""
-        raise RuntimeError(f"proxy pass failed: HTTP {tr.status_code}{suffix}")
     try:
-        token_response = tr.json()
-    except requests.exceptions.JSONDecodeError as exc:
-        raise RuntimeError("fpn/token returned invalid JSON") from exc
-    tok = token_response.get("token") if isinstance(token_response, dict) else None
-    if not isinstance(tok, str) or not tok:
-        raise RuntimeError("fpn/token response has no token field")
-    try:
-        validate_proxy_pass_jwt(tok)
-    except ProxyPassValidationError as exc:
-        raise RuntimeError(f"rejected ProxyPass JWT: {exc}") from exc
+        headers = {
+            "Authorization": f"Bearer {access}",
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "User-Agent": "firefox-ip-protection-pool/1.0",
+        }
+        st = guardian_request("GET", "/api/v1/fpn/status", headers=headers, label="fpn/status")
+        print("[*] fpn/status", f"HTTP {st.status_code}")
+        if st.status_code == 401:
+            raise RuntimeError("Guardian authentication rejected the OAuth token (HTTP 401)")
+        if st.status_code == 403:
+            raise RuntimeError("this Firefox Account is not eligible for IP Protection (HTTP 403)")
+        if st.status_code == 429 or 500 <= st.status_code <= 599:
+            retry_after = _retry_after_seconds(st.headers.get("Retry-After"))
+            suffix = (
+                f"; retry after {retry_after:g}s"
+                if st.status_code == 429 and retry_after is not None
+                else ""
+            )
+            raise RuntimeError(f"fpn/status failed: HTTP {st.status_code}{suffix}")
+        if st.status_code == 404:
+            ar = guardian_request("POST", "/api/v1/fpn/activate", headers=headers, label="fpn/activate")
+            print("[*] fpn/activate", f"HTTP {ar.status_code}")
+            if ar.status_code == 401:
+                raise RuntimeError("Guardian authentication failed during activation (HTTP 401)")
+            if ar.status_code == 403:
+                raise RuntimeError("this Firefox Account is not eligible for activation (HTTP 403)")
+            if not 200 <= ar.status_code < 300:
+                retry_after = _retry_after_seconds(ar.headers.get("Retry-After"))
+                suffix = (
+                    f"; retry after {retry_after:g}s"
+                    if ar.status_code == 429 and retry_after is not None
+                    else ""
+                )
+                raise RuntimeError(f"fpn/activate failed: HTTP {ar.status_code}{suffix}")
+        elif not 200 <= st.status_code < 300:
+            raise RuntimeError(f"fpn/status failed: HTTP {st.status_code}")
 
-    # Only replace last-good credentials after Guardian returns a valid ProxyPass JWT.
-    atomic_write_text(TOKENS / "fxa_token.txt", access + "\n")
-    atomic_write_text(TOKENS / "proxy_pass.jwt", tok + "\n")
-    atomic_write_text(TOKENS / "session_token.txt", session_token + "\n")
-    atomic_write_text(TOKENS / "session.json", json.dumps(session_json, indent=2) + "\n")
-    account_meta_path = TOKENS / "account_meta.json"
-    try:
-        existing_meta = json.loads(account_meta_path.read_text(encoding="utf-8"))
-        account_meta = existing_meta if isinstance(existing_meta, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        account_meta = {}
-    account_meta.update({"email": email, "uid": uid, "sessionToken": session_token})
-    atomic_write_text(TOKENS / "account_meta.json", json.dumps(account_meta, indent=2) + "\n")
-    print("[+] saved tokens/proxy_pass.jwt")
+        tr = guardian_request("GET", "/api/v1/fpn/token", headers=headers, label="fpn/token")
+        print("[*] fpn/token", f"HTTP {tr.status_code}")
+        if tr.status_code == 401:
+            raise RuntimeError("Guardian authentication rejected the OAuth token (HTTP 401)")
+        if tr.status_code == 403:
+            raise RuntimeError("this Firefox Account is not eligible for a ProxyPass (HTTP 403)")
+        if tr.status_code == 404:
+            raise RuntimeError("Guardian registration is unavailable after activation (HTTP 404)")
+        if not 200 <= tr.status_code < 300:
+            retry_after = _retry_after_seconds(tr.headers.get("Retry-After"))
+            suffix = (
+                f"; retry after {retry_after:g}s"
+                if tr.status_code == 429 and retry_after is not None
+                else ""
+            )
+            raise RuntimeError(f"proxy pass failed: HTTP {tr.status_code}{suffix}")
+        try:
+            token_response = tr.json()
+        except requests.exceptions.JSONDecodeError as exc:
+            raise RuntimeError("fpn/token returned invalid JSON") from exc
+        tok = token_response.get("token") if isinstance(token_response, dict) else None
+        if not isinstance(tok, str) or not tok:
+            raise RuntimeError("fpn/token response has no token field")
+        try:
+            claims = validate_proxy_pass_jwt(tok, min_ttl=ROTATE_BEFORE_SECONDS)
+        except ProxyPassValidationError as exc:
+            raise RuntimeError(f"rejected ProxyPass JWT: {exc}") from exc
 
-
-def wait_code_file(path: Path, timeout: int = 600) -> str:
-    print(f"[*] waiting for code file {path} (timeout {timeout}s)")
-    end = time.time() + timeout
-    while time.time() < end:
-        if path.exists():
-            code = path.read_text(encoding="utf-8").strip()
-            if re.fullmatch(r"\d{6}", re.sub(r"\D", "", code)[:6] or ""):
-                return re.sub(r"\D", "", code)[:6]
-        time.sleep(2)
-    raise TimeoutError("code file not provided in time")
+        # Publish only the long-lived session inputs plus the initial,
+        # replaceable ProxyPass cache.  The short-lived OAuth access token is
+        # never written.  Publication also supersedes an old session's
+        # persisted cooldown under the same lock used by the helper.
+        persist_bootstrap_credentials(
+            session_token=session_token,
+            email=email,
+            uid=uid,
+            proxy_pass=tok,
+            expires_at=float(claims["exp"]),
+            http_status=tr.status_code,
+        )
+        print("[+] saved long-lived session credentials and initial ProxyPass")
+    finally:
+        if oauth_client is not None and access:
+            try:
+                oauth_client.destroy_token(access)
+                print("[+] destroyed temporary OAuth access token")
+            except Exception as exc:
+                print(
+                    f"[!] could not destroy temporary OAuth token ({type(exc).__name__}); it was not saved",
+                    file=sys.stderr,
+                )
+            access = None
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--email", default=os.environ.get("IPP_EMAIL"))
-    ap.add_argument("--password", default=os.environ.get("IPP_PASSWORD"))
-    ap.add_argument("--code", default=None, help="6-digit Mozilla email code")
-    ap.add_argument("--wait-code-file", action="store_true")
-    ap.add_argument("--code-file", default=str(TOKENS / "email_code.txt"))
+    ap = argparse.ArgumentParser(
+        description="Interactively save the FxA session required for automatic ProxyPass renewal"
+    )
+    ap.add_argument("--email", help="Firefox Account email (prompted when omitted)")
     args = ap.parse_args()
-    if not args.email or not args.password:
-        print("need --email and --password (or IPP_EMAIL / IPP_PASSWORD)", file=sys.stderr)
+
+    if not sys.stdin.isatty():
+        print(
+            "[!] bootstrap requires an interactive terminal; passwords are not accepted from pipes",
+            file=sys.stderr,
+        )
         return 2
 
-    code = args.code
-    if not code and Path(args.code_file).exists():
-        code = Path(args.code_file).read_text(encoding="utf-8").strip()
-    if not code and args.wait_code_file:
-        # start browser first then wait
-        pass
+    email = (args.email or input("Firefox Account email: ")).strip()
+    if not email:
+        print("email cannot be empty", file=sys.stderr)
+        return 2
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(
+            "[!] Playwright is required; install requirements-bootstrap.txt first",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        password = prompt_password()
+    except RuntimeError as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        return 2
 
     with sync_playwright() as p:
+        # This intentionally launches Playwright Firefox, not Chromium.
         browser = p.firefox.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1280, "height": 900}, locale="en-US")
-        page = context.new_page()
-        pass_fastly_and_login(page, args.email, args.password)
-
-        if "signin_token_code" in page.url or "confirmation code" in page.inner_text("body").lower():
-            if not code and args.wait_code_file:
-                code = wait_code_file(Path(args.code_file))
-            if not code:
-                print(
-                    "[!] Mozilla sent a 6-digit email code. Put it in tokens/email_code.txt or pass --code",
-                    file=sys.stderr,
-                )
-                print(f"    page={safe_page_location(page.url)}", file=sys.stderr)
-                save_storage_state(context, DATA / "fxa_pending_code.json")
-                browser.close()
-                return 3
-            submit_email_code(page, code)
-
-        # Prefer API login using challenged browser cookies after verified session
         try:
-            session_json = api_login_with_page(page, args.email, args.password)
-        except Exception as e:
-            print(f"[!] api login after code failed ({type(e).__name__})", file=sys.stderr)
-            # If UI is logged in, user may still need another path
-            save_storage_state(context, DATA / "fxa_after_code.json")
-            browser.close()
-            return 4
+            context = browser.new_context(viewport={"width": 1280, "height": 900}, locale="en-US")
+            page = context.new_page()
+            pass_fastly_and_login(page, email, password)
 
-        save_storage_state(context, DATA / "fxa_logged_in.json")
-        browser.close()
+            if "signin_token_code" in page.url or "confirmation code" in page.inner_text("body").lower():
+                submit_email_code(page, prompt_email_code())
+
+            try:
+                session_json = api_login_with_page(page, email, password)
+            except Exception as exc:
+                print(f"[!] API login after verification failed ({type(exc).__name__})", file=sys.stderr)
+                return 4
+        finally:
+            password = ""
+            browser.close()
 
     try:
         oauth_and_proxy_pass(session_json)
@@ -449,10 +581,11 @@ def main() -> int:
     except Exception as exc:
         print(f"[!] bootstrap token exchange failed ({type(exc).__name__})", file=sys.stderr)
         return 1
+    cleanup_legacy_credential_cache(remove_browser_storage=True)
     print("[*] bootstrap complete. Next:")
+    print("    python refresh_tokens.py --force")
     print("    python ipp_pool.py token-status")
-    print("    python ipp_pool.py probe --country US")
-    print("    python ipp_pool.py run --limit 20 --rotator 127.0.0.1:1090")
+    print("    python ipp_pool.py run")
     return 0
 
 

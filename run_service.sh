@@ -60,8 +60,13 @@ HTTP_ROTATOR="${IPP_HTTP_ROTATOR:-$listen_host:8080}"
 mkdir -p logs tokens data export
 
 if [[ "$REFRESH_BEFORE_START" == 1 ]]; then
-  # Refresh is best effort because the pool can reuse a still-valid last-known token.
-  "$PYTHON_BIN" refresh_tokens.py >>logs/refresh.log 2>&1 || true
+  # Use TokenStore's full state machine.  A normal fresh cache avoids network
+  # work, while an expired rate-limit/auth block is forced through real
+  # revalidation instead of being cleared merely because the old JWT is fresh.
+  # Diagnostics are sanitized and remain visible in the terminal/journal.
+  if ! "$PYTHON_BIN" ipp_pool.py token-refresh; then
+    echo "Startup token refresh failed; trying the last-known-good token" >&2
+  fi
 fi
 
 cmd=(

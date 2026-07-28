@@ -1,17 +1,22 @@
 [Unit]
-Description=Firefox IP Protection public proxy pool
+Description=Firefox IP Protection SOCKS5/HTTP proxy pool
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=120
-StartLimitBurst=20
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+User=ipp-pool
+Group=ipp-pool
+UMask=0077
 WorkingDirectory=/opt/firefox-ip-protection-pool
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/firefox-ip-protection-pool/ipp-pool.env
 ExecStart=/opt/firefox-ip-protection-pool/run_service.sh
-Restart=always
-RestartSec=3
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=20
