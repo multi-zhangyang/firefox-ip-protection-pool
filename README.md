@@ -1,20 +1,45 @@
 # Firefox IP Protection SOCKS5 / HTTP 代理池
 
-本项目将 Firefox IP Protection 的多国家 TCP 出口转换为 SOCKS5 和 HTTP 代理。默认同步 Remote Settings 中的可用国家，为每个节点分配稳定地址，并提供跨国家的综合随机入口。
+将 Firefox IP Protection（Mozilla FPN）的多国家 TCP 出口转换为本地 SOCKS5 和 HTTP 代理。默认同步 Remote Settings 中的可用国家，为每个节点分配稳定地址，并提供跨国家的综合随机入口。
 
 综合入口先等概率选择一个国家，再从该国选择节点；节点较多的国家不会获得更高权重。上游的 `REC` 推荐记录使用独立模式，不参与默认随机池。
 
 > 仅使用你本人有权使用的 Firefox Account、网络和 IP Protection 服务，并遵守适用条款与法律。
 
+## 快速开始
+
+从拿到一个具有 IP Protection 资格的 Firefox Account 到代理可用，共 4 步：
+
+```bash
+# 1. 安装
+git clone https://github.com/multi-zhangyang/firefox-ip-protection-pool.git
+cd firefox-ip-protection-pool
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+
+# 2. 在桌面 Firefox 中导出登录凭据（见下方"桌面 Firefox 准备凭据"）
+#    -> 得到 fxa-renewal-credentials.json
+
+# 3. 导入 VPS（把文件放到 .ipp-import 后执行）
+sudo -u ipp-pool -H .venv/bin/python import_credentials.py \
+  tokens/.credential-import.json --delete-source
+
+# 4. 启动并验证
+.venv/bin/python ipp_pool.py run
+curl -x socks5h://127.0.0.1:1090 https://ipinfo.io/json
+```
+
+如果不想用桌面 Firefox（或者无法访问桌面），也可以在本机直接跑 `login_and_bootstrap.py` 命令行引导完成认证，见[备用登录方式](#备用登录方式)。
+
 ## 工作原理
 
-Firefox 桌面端当前的大致链路如下：
+Firefox 桌面端当前的链路：
 
 ```text
 Firefox Account / OAuth
     -> Guardian（vpn.mozilla.org）
     -> GET /api/v1/fpn/token
-    -> 短时 ProxyPass JWT
+    -> 短时 ProxyPass JWT（每 10 分钟过期）
     -> TLS 连接 Remote Settings 提供的出口节点
     -> HTTPS CONNECT + Proxy-Authorization: Bearer <JWT>
     -> 目标网站
@@ -30,89 +55,67 @@ Firefox Account / OAuth
     -> 目标网站
 ```
 
-上游目前优先使用 `CONNECT`。完整的 MASQUE/HTTP3/QUIC/UDP 数据面尚未实现；只有 MASQUE 的记录会被明确标记为不支持，不会被错误地当成 CONNECT 节点。
+上游目前优先使用 `CONNECT`。MASQUE/HTTP3/QUIC/UDP 数据面尚未实现；MASQUE-only 记录会被明确标记为不支持，不会被当成 CONNECT 节点。
 
 ## 主要功能
 
 - 从 Firefox Remote Settings 的 `vpn-serverlist` 同步多国家节点。
-- 对 Firefox 版本门控、`filter_expression`、锁定、隔离和协议字段进行保守解析。
+- 对 Firefox 版本门控、`filter_expression`、锁定、隔离和协议字段做保守解析。
 - 为每个可用节点启动独立 SOCKS5 和 HTTP 监听器。
-- 为所有已启用国家提供国家等权的随机 SOCKS5/HTTP 综合入口。
+- 为所有已启用国家提供国家等权随机的 SOCKS5/HTTP 综合入口。
 - 持久化稳定端口映射，避免上游列表重排导致已有地址漂移。
 - 支持本地监听认证，并拒绝无认证的非回环开放代理。
-- 支持 ProxyPass JWT 检查、Guardian 配额查询和有界 token 刷新。
-- 使用 ETag、`If-None-Match`、`304` 和最后已知有效缓存适配上游热更新。
+- 自动续期 ProxyPass JWT，支持 Guardian 配额查询与有界退避重试。
+- 使用 ETag、`If-None-Match`、`304` 和 last-known-good 适配上游热更新。
 - 导出不含认证的地址、可直接使用的 URL 和结构化节点元数据。
 
-主要组件：
+## 目录结构
 
-| 组件 | 作用 |
+| 文件/目录 | 作用 |
 | --- | --- |
-| `ipp_pool.py` | 同步节点、检查 token、启动独立监听器和综合入口 |
-| `refresh_tokens.py` | 用已保存的 FxA session 换取 OAuth token 和短时 ProxyPass JWT |
-| `tools/firefox-credential-export.html` | 从桌面 Firefox 配置中离线导出最小续期凭据 |
-| `import_credentials.py` | 在 VPS 上导入凭据并执行续期验收 |
-| `login_and_bootstrap.py` | 备用的命令行登录引导工具 |
-| `run_service.sh` | 使用环境变量启动服务 |
-| `start_pool.sh` | 重启并查看 systemd 服务状态的辅助脚本 |
-| `data/vpn-serverlist.json` | Remote Settings 最后已知有效节点缓存 |
-| `data/port-map.json` | 节点身份到本地端口的稳定映射 |
+| `ipp_pool.py` | 主程序：同步节点、检查 token、启动监听器和综合入口 |
+| `refresh_tokens.py` | 用 FxA session 换取 OAuth token 和短时 ProxyPass JWT |
+| `import_credentials.py` | 在 VPS 上导入桌面导出的凭据并执行续期验收 |
+| `login_and_bootstrap.py` | 备用的命令行登录引导（无需桌面 Firefox） |
+| `refresh_state.py` | 续期状态持久化与跨进程锁 |
+| `tools/firefox-credential-export.html` | 从桌面 Firefox 离线导出最小续期凭据 |
+| `run_service.sh` / `start_pool.sh` | systemd 启动辅助脚本 |
+| `examples/` | systemd unit 与 env 模板 |
+| `docs/` | 上游兼容性记录（含 2026-08-12 认证链路观察） |
 
 ## 环境要求
 
-- Python 3.10 或更高版本。
-- Linux 为推荐运行环境；核心 Python 代码也可在具备相应网络能力的其他环境中运行。
+- Python 3.10+，Linux 推荐；核心代码也可在其他具有相应网络能力的平台运行。
 - 具有 IP Protection 使用资格的 Firefox Account。
 - 能访问 Firefox Accounts、Guardian、Remote Settings 和记录中的上游节点。
 
-## 安装与公开节点同步
+核心依赖只有 `requests` 与 `PyFxA`，不需要安装 Playwright 或浏览器（仅备用登录方式需要）。
 
-```bash
-git clone https://github.com/multi-zhangyang/firefox-ip-protection-pool.git
-cd firefox-ip-protection-pool
+## 桌面 Firefox 准备凭据
 
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+登录和验证码在用户自己的 Windows / macOS 电脑上完成。VPS 只接收登录完成后的最小续期凭据，不需要安装 Firefox、Playwright 或图形桌面。
 
-# 只同步公开节点列表，不需要读取 token
-.venv/bin/python ipp_pool.py sync
-```
-
-同步日志只应包含节点数量、国家统计和缓存状态，不应包含账号凭据。上游节点会随 Firefox 版本和服务端配置变化，以当前同步结果为准。
-
-`requirements.txt` 只安装核心代理池和无浏览器 token 刷新所需的 `requests` 与 `PyFxA`，不会安装 Playwright 或下载浏览器。
-
-## 在桌面 Firefox 中准备凭据
-
-登录和验证码在用户自己的 Windows 或 macOS 电脑上完成。VPS 只接收登录完成后的最小续期凭据，不需要安装 Firefox、Playwright 或图形桌面。
-
-账号密码和验证码只输入 Firefox 显示的 Mozilla 登录界面；本项目的导出页面和 VPS 都不会询问这些内容。
-
-建议在桌面 Firefox 中为这台 VPS 新建一个独立配置：
+建议为这台 VPS 新建一个独立 Firefox 配置：
 
 1. 在 Firefox 地址栏打开 `about:profiles`，新建并启动一个配置。
-2. 在 Firefox 的账户菜单或“设置 → 同步”中登录具有 IP Protection 资格的 Firefox Account。这里需要登录 Firefox 本身，而不只是登录 `accounts.firefox.com` 网页。
-3. 在正常的浏览器页面中输入密码并完成邮箱验证码、CAPTCHA、TOTP 或安全密钥验证。
-4. 打开 Firefox 的 IP Protection 面板并完成首次启用，保持联网直到账户和设备注册完成。
-5. 再次打开 `about:profiles`，找到这个配置的“根目录”。
+2. 在账户菜单或"设置 → 同步"中登录具有 IP Protection 资格的 Firefox Account（登录 Firefox 本身，不只是网页）。
+3. 输入密码并完成邮箱验证码、CAPTCHA、TOTP 或安全密钥验证。
+4. 打开 Firefox 的 IP Protection 面板完成首次启用，保持联网直到账户和设备注册完成。
+5. 回到 `about:profiles`，记下该配置的"根目录"路径。
 
-如果 Firefox 中没有 IP Protection 面板，先确认所用 Firefox 版本、账号和当前服务范围具备使用资格；VPS 端不能替未获资格的账号启用服务。
+> 如果 Firefox 中没有 IP Protection 面板，先确认 Firefox 版本、账号和服务范围具备使用资格；VPS 端不能替未获资格的账号启用服务。
 
-在桌面电脑上通过 GitHub 的“Code → Download ZIP”下载并解压本仓库，双击本地的 [`tools/firefox-credential-export.html`](tools/firefox-credential-export.html) 并选择使用 Firefox 打开。不要直接使用 GitHub 文件预览页；导出器必须作为本地文件运行。该页面不连接网络；选择上述根目录中的 `signedInUser.json` 后，它会检查账户验证和 Firefox 设备注册状态，并生成 `fxa-renewal-credentials.json`。导出的 JSON 只包含：
+然后导出最小凭据包：
 
-```text
-email
-uid
-session_token
-```
+1. 下载本仓库 ZIP 并解压（或直接克隆到桌面机器）。
+2. 用 Firefox 双击打开 `tools/firefox-credential-export.html`（必须是本地文件，不要用 GitHub 预览页；该页面不联网）。
+3. 选择上述配置根目录中的 `signedInUser.json`，页面会检查账户验证和设备注册状态，生成 `fxa-renewal-credentials.json`。
 
-Windows 和 macOS 使用同一个导出页面。Windows 的 `about:profiles` 会在资源管理器中打开根目录，macOS 会在 Finder 中显示根目录。
-
-不要直接复制整个 `signedInUser.json`，其中还可能包含与本项目无关的 OAuth 缓存和账户资料。导出的最小凭据包同样等同于 Firefox 登录会话，不要将它发送到聊天、邮件、issue 或公共网盘。关闭 Firefox 不会撤销会话；在该 Firefox 配置中退出账户、从账号设备列表撤销会话或执行“退出所有设备”，会使 VPS 上的自动续期停止。
+导出的 JSON 只包含 `email`、`uid`、`session_token` 三个字段。**不要**直接复制整个 `signedInUser.json`（它还包含无关的 OAuth 缓存）。凭据包等同于登录会话：不要发送到聊天、邮件、issue 或公共网盘。
 
 ## 将凭据导入 VPS
 
-在 VPS 上安装核心程序。服务用户不需要登录 shell，运行时目录由它单独拥有：
+创建服务用户并安装：
 
 ```bash
 getent group ipp-pool >/dev/null 2>&1 || sudo groupadd --system ipp-pool
@@ -133,7 +136,7 @@ sudo install -d -o ipp-pool -g ipp-pool -m 0700 \
   /opt/firefox-ip-protection-pool/export
 ```
 
-先在远端用户的主目录建立只允许该用户访问的传输目录：
+在远端用户主目录建立仅自己可访问的传输目录并上传凭据：
 
 ```bash
 ssh VPS_USER@VPS_HOST 'install -d -m 700 ~/.ipp-import'
@@ -142,20 +145,16 @@ ssh VPS_USER@VPS_HOST 'install -d -m 700 ~/.ipp-import'
 Windows PowerShell：
 
 ```powershell
-scp "$HOME\Downloads\fxa-renewal-credentials.json" `
-  VPS_USER@VPS_HOST:.ipp-import/fxa-renewal-credentials.json
+scp "$HOME\Downloads\fxa-renewal-credentials.json" VPS_USER@VPS_HOST:.ipp-import/
 ```
 
-Windows 10/11 如果没有 `ssh` 或 `scp`，请先在“可选功能”中安装 OpenSSH Client，或使用 WinSCP/SFTP 将文件上传到同一个 `.ipp-import` 目录。
-
-macOS 终端：
+macOS / Linux：
 
 ```bash
-scp ~/Downloads/fxa-renewal-credentials.json \
-  VPS_USER@VPS_HOST:.ipp-import/fxa-renewal-credentials.json
+scp ~/Downloads/fxa-renewal-credentials.json VPS_USER@VPS_HOST:.ipp-import/
 ```
 
-在 VPS 上将文件交给服务用户，然后导入：
+在 VPS 上交给服务用户并导入：
 
 ```bash
 sudo install -o ipp-pool -g ipp-pool -m 0600 \
@@ -170,7 +169,9 @@ sudo -u ipp-pool -H \
   --delete-source
 ```
 
-导入命令会把 session 原子写入 `tokens/renewal_credentials.json`，权限设为 `0600`，并立即强制请求一个新的 ProxyPass。新凭据验收成功前，旧 ProxyPass 不会被用于建立新连接。验收成功后检查状态：
+导入命令会把 session 原子写入 `tokens/renewal_credentials.json`（0600），立即强制请求新的 ProxyPass。验收失败会保留 `.credential-import.json` 供重试。
+
+检查状态：
 
 ```bash
 sudo -u ipp-pool -H \
@@ -178,7 +179,7 @@ sudo -u ipp-pool -H \
   /opt/firefox-ip-protection-pool/ipp_pool.py token-status
 ```
 
-有效状态包含：
+有效状态：
 
 ```text
 automatic_renewal_ready: true
@@ -186,21 +187,11 @@ proxy_pass.valid: true
 refresh_state.result: success
 ```
 
-如果续期验收失败，导入器会保留 `/opt/firefox-ip-protection-pool/tokens/.credential-import.json` 以便重试。处理网络、账号资格或限流问题后重新运行同一导入命令；不再使用时手动删除该文件。
+确认成功后删除 Windows / macOS 下载目录中的 `fxa-renewal-credentials.json`。
 
-确认导入成功后，删除 Windows 或 macOS 下载目录中的 `fxa-renewal-credentials.json`。
+## 启动与使用
 
-## 自动续期
-
-服务每 30 秒检查一次 ProxyPass，并在到期前 120 秒更新。刷新时会使用 FxA session 获取临时 OAuth token，再从 Guardian 获取新的 ProxyPass；临时 OAuth token 不会写入磁盘，用完后会向 FxA 尝试销毁。
-
-网络错误和服务端限流会按响应信息退避，尚未过期的 ProxyPass 在此期间仍可继续使用。刷新状态保存在 `tokens/refresh_state.json`，服务重启后仍会遵守冷却时间。systemd 负责开机启动和进程恢复，不需要额外配置 cron。
-
-FxA session 被撤销后不能继续续期。出现 `reauth_required` 时，请在桌面 Firefox 中重新登录和验证，重新导出凭据并在 VPS 上再次导入；也可以在本机直接运行上面的 `login_and_bootstrap.py` 命令行引导完成重新认证。实测 Mozilla 会周期性撤销长期自动续期会话（约 10 天一次），建议把 `tokens/refresh_state.json` 的 `result` 纳入监控。
-
-## 默认启动：所有国家与综合随机入口
-
-最简单的启动方式是：
+最简单的方式：
 
 ```bash
 .venv/bin/python ipp_pool.py run
@@ -208,11 +199,8 @@ FxA session 被撤销后不能继续续期。出现 `reauth_required` 时，请�
 
 默认行为：
 
-- 绑定 `127.0.0.1`。
-- 启动所有可用的非 `REC` 国家，不应用 `--countries` 和 `--limit`。
-- 为每个节点分配独立 SOCKS5 和 HTTP 端口。
-- 在 `127.0.0.1:1090` 启动 SOCKS5 综合随机入口。
-- 在 `127.0.0.1:8080` 启动 HTTP 综合随机入口。
+- 绑定 `127.0.0.1`，启动所有可用的非 `REC` 国家。
+- 每个节点分配独立 SOCKS5/HTTP 端口；在 `127.0.0.1:1090`（SOCKS5）和 `127.0.0.1:8080`（HTTP）启动综合随机入口。
 - 综合入口按国家等权随机选择，国家内再选择节点。
 
 默认端口布局：
@@ -221,13 +209,13 @@ FxA session 被撤销后不能继续续期。出现 `reauth_required` 时，请�
 | --- | --- |
 | 独立 SOCKS5 节点 | `127.0.0.1:21000+` |
 | 独立 HTTP 节点 | `127.0.0.1:31000+` |
-| 所有启用国家的 SOCKS5 综合随机入口 | `127.0.0.1:1090` |
-| 所有启用国家的 HTTP 综合随机入口 | `127.0.0.1:8080` |
+| SOCKS5 综合随机入口 | `127.0.0.1:1090` |
+| HTTP 综合随机入口 | `127.0.0.1:8080` |
 
 使用示例：
 
 ```bash
-# 独立节点；socks5h 会让域名解析也经过代理
+# 独立节点；socks5h 让域名解析也经过代理
 curl -x socks5h://127.0.0.1:21000 https://ipinfo.io/json
 curl -x http://127.0.0.1:31000 https://ipinfo.io/json
 
@@ -236,95 +224,45 @@ curl -x socks5h://127.0.0.1:1090 https://ipinfo.io/json
 curl -x http://127.0.0.1:8080 https://ipinfo.io/json
 ```
 
-HTTP 转发器只接受 absolute-form 的明文 `http://` 请求；访问 HTTPS 必须使用 `CONNECT`。请求体上限为 8 MiB，并拒绝 chunked 编码、冲突或非法的 `Content-Length` 以及危险的 hop-by-hop 头。
+HTTP 转发器只接受 absolute-form 的明文 `http://` 请求；HTTPS 必须使用 `CONNECT`。请求体上限 8 MiB，拒绝 chunked 编码、冲突/非法 `Content-Length` 和危险的 hop-by-hop 头。
 
-## 通用国家筛选
-
-仅在确实需要缩小运行集合时使用 ISO 国家代码列表：
+### 国家筛选与 REC 模式
 
 ```bash
+# 只运行指定国家
 .venv/bin/python ipp_pool.py run \
   --countries COUNTRY_CODE_A,COUNTRY_CODE_B \
   --rotate-mode random
-```
 
-使用 `--countries` 后，综合入口只从指定国家中选择。`--limit` 用于限制启动的节点总数。
-
-如需关闭某个综合入口：
-
-```bash
+# 关闭综合入口
 .venv/bin/python ipp_pool.py run --rotator off
 .venv/bin/python ipp_pool.py run --http-rotator off
-```
 
-## 独立的 REC 推荐模式
-
-`REC` 是上游推荐/Anycast 记录，不代表普通国家，也不属于默认多国家综合随机池。仅在明确需要上游推荐记录时单独启动：
-
-```bash
+# 独立的 REC 推荐模式（不混入普通国家池）
 .venv/bin/python ipp_pool.py run --recommended
 ```
 
-不要把 `--recommended` 与 `--countries` 混用。推荐模式与默认的“所有非 `REC` 国家等权随机”模式语义不同。
+`REC` 是上游推荐/Anycast 记录，不属于普通国家，不要与 `--countries` 混用。
 
-## 监听认证与公网部署
+### 监听认证与公网部署
 
-程序默认只绑定回环地址。绑定非回环地址时，核心程序要求完整的监听用户名和密码；没有认证时会拒绝启动，除非用户显式选择不安全的开放代理参数。生产环境不要使用开放代理参数。
+默认只绑定回环地址。绑定非回环地址时**必须**配置完整监听认证，否则拒绝启动（除非显式使用 `--allow-open-proxy`，生产环境不要使用）。
 
-认证文件格式：
-
-```text
-USER=ipp
-PASS=替换为随机长密码
-```
-
-保存为 `tokens/proxy_listen_auth.txt` 并限制权限：
+认证文件 `tokens/proxy_listen_auth.txt`，格式 `USER=ipp` / `PASS=<随机长密码>`，权限 0600：
 
 ```bash
 chmod 600 tokens/proxy_listen_auth.txt
 ```
 
-核心程序也支持 `IPP_LISTEN_USER` 和 `IPP_LISTEN_PASS`。`run_service.sh` 不会把密码复制到命令行参数；Python 进程会直接读取环境变量或认证文件。长期 systemd 部署优先使用归属于服务用户的 `0600` 认证文件，不要把密码写进可公开读取的环境示例文件。配置认证后，使用客户端的独立认证参数，避免把密码嵌入代理 URL 或 shell 历史：
+客户端使用：
 
 ```bash
 curl --proxy-user 'USER:PASSWORD' -x socks5h://127.0.0.1:1090 https://ipinfo.io/ip
 ```
 
-安全检查覆盖所有实际监听地址，而不只检查 `--bind`。因此，即使独立节点绑定回环地址，只要 `--rotator` 或 `--http-rotator` 指向非回环 IP、通配地址或 DNS 名称，也必须配置完整认证；非法端口、裸 IPv6 authority 和 URL 形式的监听参数会在读取 token 或访问网络前被拒绝。IPv6 回环默认综合入口会规范化为 `[::1]:1090` 和 `[::1]:8080`。
+安全策略会检查所有实际监听地址：只要任一综合入口使用非回环 IP、通配地址或 DNS 名称，就必须配置认证。公网部署还应限制防火墙来源、只开放必要端口、定期轮换密码。
 
-公网部署还应限制防火墙来源、只开放必要端口并定期轮换密码。`--advertise-host` 只影响导出地址，不改变监听安全策略。
-
-## 通用服务脚本
-
-`run_service.sh` 读取以下环境变量并启动代理池。默认监听回环地址并启用所有可用的非 `REC` 国家。
-
-可用环境变量：
-
-| 环境变量 | 默认值 | 作用 |
-| --- | --- | --- |
-| `IPP_PYTHON` | 项目 `.venv/bin/python`，不存在时使用 `python3` | Python 可执行文件 |
-| `IPP_BIND` | `127.0.0.1` | 本地监听地址 |
-| `IPP_ADVERTISE_HOST` | 与 `IPP_BIND` 相同 | 导出文件中的主机名或地址 |
-| `IPP_COUNTRIES` | 空 | 可选的 ISO 国家代码列表；空表示所有非 `REC` 国家 |
-| `IPP_LIMIT` | 空 | 可选的全局节点上限；空表示不限制 |
-| `IPP_ROTATOR` | `<IPP_BIND>:1090` | SOCKS5 综合入口，使用 `off` 可关闭 |
-| `IPP_HTTP_ROTATOR` | `<IPP_BIND>:8080` | HTTP 综合入口，使用 `off` 可关闭 |
-| `IPP_ROTATE_MODE` | `random` | 综合入口模式，可选 `random` 或 `rr` |
-| `IPP_FIREFOX_VERSION` | `155.0a1` | Remote Settings 版本门控使用的 Firefox 版本；需要复现其他版本时覆盖 |
-| `IPP_CLIENT_COUNTRY` | 空 | 当前客户端所在国家的 ISO 代码，仅用于执行上游 `env.country` 过滤；程序不会自动猜测 |
-| `IPP_REFRESH_BEFORE_START` | `1` | 启动前是否尽力刷新一次 token |
-
-示例：
-
-```bash
-IPP_BIND=127.0.0.1 IPP_ROTATE_MODE=random ./run_service.sh
-```
-
-如果把 `IPP_BIND` 改成非回环地址，必须先提供认证文件或完整的 `IPP_LISTEN_USER`/`IPP_LISTEN_PASS`。脚本不会自动探测公网地址，也不会静默开放代理。
-
-## systemd 部署
-
-完成凭据导入和续期验收后，安装项目提供的环境配置与 unit：
+### systemd 部署
 
 ```bash
 sudo install -d -m 0755 /etc/firefox-ip-protection-pool
@@ -337,37 +275,33 @@ sudo systemctl enable --now ipp-pool.service
 sudo systemctl --no-pager --full status ipp-pool.service
 ```
 
-`examples/ipp-pool.env.example` 只存放非敏感运行参数。修改安装后的副本并重启服务即可生效：
+不要往 `ipp-pool.env` 写密码或 token；监听认证放在 `tokens/proxy_listen_auth.txt`。
+
+日志与状态：
 
 ```bash
-sudoedit /etc/firefox-ip-protection-pool/ipp-pool.env
-sudo systemctl restart ipp-pool.service
-```
-
-不要把密码、session token、ProxyPass JWT 或 OAuth token 写入该环境文件。公网监听的认证信息应放在 `/opt/firefox-ip-protection-pool/tokens/proxy_listen_auth.txt`，并设置为 `0600 ipp-pool:ipp-pool`。
-
-服务日志写入 journald：
-
-```bash
-sudo journalctl -u ipp-pool.service -n 100 --no-pager
 sudo journalctl -u ipp-pool.service -f
 sudo -u ipp-pool -H /opt/firefox-ip-protection-pool/.venv/bin/python \
   /opt/firefox-ip-protection-pool/ipp_pool.py token-status
 ```
 
-如果状态显示 `reauth_required`，请回到桌面 Firefox 重新登录并导出，在 VPS 上重新运行导入命令，然后重启服务：
+### 环境变量（run_service.sh）
 
-```bash
-sudo systemctl restart ipp-pool.service
-```
+| 环境变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `IPP_PYTHON` | 项目 `.venv/bin/python`，否则 `python3` | Python 可执行文件 |
+| `IPP_BIND` | `127.0.0.1` | 本地监听地址 |
+| `IPP_ADVERTISE_HOST` | 同 `IPP_BIND` | 导出文件中的主机名/地址 |
+| `IPP_COUNTRIES` | 空 | 可选的 ISO 国家列表；空 = 所有非 `REC` 国家 |
+| `IPP_LIMIT` | 空 | 可选的全局节点上限 |
+| `IPP_ROTATOR` | `<IPP_BIND>:1090` | SOCKS5 综合入口，`off` 关闭 |
+| `IPP_HTTP_ROTATOR` | `<IPP_BIND>:8080` | HTTP 综合入口，`off` 关闭 |
+| `IPP_ROTATE_MODE` | `random` | 综合入口模式：`random` 或 `rr` |
+| `IPP_FIREFOX_VERSION` | `155.0a1` | Remote Settings 版本门控用的 Firefox 版本 |
+| `IPP_CLIENT_COUNTRY` | 空 | 客户端所在国家 ISO 码，仅用于上游 `env.country` 过滤 |
+| `IPP_REFRESH_BEFORE_START` | `1` | 启动前是否尽力刷新一次 token |
 
-`start_pool.sh` 是 systemd 辅助脚本，可用 `IPP_SERVICE_NAME` 指定不同的 unit 名称。它会重启服务，因此不应用作无副作用的配置检查。
-
-## 稳定端口映射与导出
-
-节点端口由稳定节点身份决定，而不是由 Remote Settings 返回顺序决定。上游插入、删除或重排记录时，已有节点的端口不会随意改变；映射保存在 `data/port-map.json`。
-
-常用导出文件：
+### 导出文件
 
 ```text
 export/socks5.txt           # 不含认证的独立 SOCKS5 地址
@@ -379,37 +313,19 @@ export/pool.json            # 运行节点、国家与端口元数据
 export/exits.json           # 同步得到的节点详情
 ```
 
-综合入口启动后会再次刷新导出，以记录实际监听地址。不要公开带认证的导出文件。
-
-## 命令速查
-
-```bash
-.venv/bin/python ipp_pool.py sync
-.venv/bin/python ipp_pool.py how-to-token
-.venv/bin/python ipp_pool.py token-status
-.venv/bin/python ipp_pool.py usage
-.venv/bin/python ipp_pool.py token-refresh
-.venv/bin/python ipp_pool.py probe --country COUNTRY_CODE
-.venv/bin/python ipp_pool.py run
-.venv/bin/python ipp_pool.py run --countries COUNTRY_CODE_A,COUNTRY_CODE_B
-.venv/bin/python ipp_pool.py run --recommended
-```
-
-`usage` 使用 Guardian 的 `HEAD /api/v1/fpn/token` 查询配额。`probe` 用于检查指定出口，响应大小限制为 64 KiB。
+不要公开带认证的导出文件。
 
 ## 备用登录方式
 
-`login_and_bootstrap.py` 保留为兼容性工具。桌面 Firefox 导出是 Windows/macOS 用户和无图形 VPS 的标准安装方式；命令行引导不适合作为无图形 VPS 的首次登录方案。
-
-命令行引导需要额外的运行依赖，用于通过 Fastly 挑战、登录和邮箱验证码：
+不想用（或无法使用）桌面 Firefox 时，可在 VPS 上直接命令行登录。需要额外依赖：
 
 ```bash
 .venv/bin/python -m pip install -r requirements-bootstrap.txt
 .venv/bin/playwright install firefox
-sudo apt install -y xvfb        # 仅在需要 headed 模式时
+sudo apt install -y xvfb   # 仅 headed 模式需要
 ```
 
-Fastly 会向自动化登录下发图形验证码，脚本默认尝试本地 OCR 无法稳定识别；推荐配置视觉模型 API 自动答题：
+Fastly 会向自动化登录下发图形验证码，本地 OCR 无法稳定识别；推荐配置视觉模型 API 自动答题（OpenAI 兼容网关，消息含 `image_url` 数据）：
 
 ```bash
 export ANTHROPIC_BASE_URL=https://your-gateway.example.com
@@ -417,9 +333,7 @@ export ANTHROPIC_AUTH_TOKEN=your-token
 export ANTHROPIC_MODEL=your-vision-model
 ```
 
-（网关必须兼容 OpenAI `/v1/chat/completions`，消息内容包含 `image_url` 数据字段。）
-
-启动方式：
+启动：
 
 ```bash
 # headless（默认）
@@ -429,25 +343,81 @@ export ANTHROPIC_MODEL=your-vision-model
 FXA_HEADLESS=0 xvfb-run -a .venv/bin/python login_and_bootstrap.py --email YOUR_EMAIL
 ```
 
-脚本会依次处理 Fastly challenge（POW/CAPTCHA）、密码、图形验证码（如出现）和邮箱 6 位验证码。已知上游行为与复刻要点见 [`docs/firefox-upstream-compatibility.md`](docs/firefox-upstream-compatibility.md) 的“认证链路观察”一节。
+脚本依次处理 Fastly challenge（POW/CAPTCHA）、密码、邮箱 6 位验证码，完成后自动保存续期凭据并获取初始 ProxyPass。之后：
 
-## Firefox 兼容性
+```bash
+.venv/bin/python refresh_tokens.py --force
+.venv/bin/python ipp_pool.py token-status
+```
 
-节点筛选会处理 Firefox 版本条件、客户端国家条件、`locked`、`quarantined` 和协议字段。`IPP_CLIENT_COUNTRY` 表示 VPS 所在国家，仅用于执行 Remote Settings 条件，不是出口国家选择器。详细兼容记录见 [`docs/firefox-upstream-compatibility.md`](docs/firefox-upstream-compatibility.md)。
+已知上游行为与复刻要点见 [`docs/firefox-upstream-compatibility.md`](docs/firefox-upstream-compatibility.md) 的"认证链路观察"一节。
+
+## 故障排查
+
+### `reauth_required` / 401（最常见）
+
+FxA session 会被 Mozilla 服务端周期性撤销（实测约 10 天一次）。此时自动续期暂停，服务可能反复重启失败：
+
+```text
+[!] token not ready: automatic renewal is paused (reauth_required)
+```
+
+恢复方法（二选一）：
+
+1. **重新导入桌面凭据**：在桌面 Firefox 重新登录 → 重新导出 → 在 VPS 上重跑导入命令 → `systemctl restart ipp-pool`。
+2. **命令行重新认证**：跑 `login_and_bootstrap.py` 走完整登录（需要邮箱验证码）。
+
+监控 `tokens/refresh_state.json` 的 `result` 字段，连续出现 `reauth_required` 时提前安排重新认证。
+
+### Fastly CAPTCHA 循环
+
+`login_and_bootstrap.py` 卡在"CAPTCHA characters"反复出题：说明 OCR 答错或未配置视觉 API。配置 `ANTHROPIC_*` 环境变量后重跑；仍不行就用 headed + xvfb 模式。
+
+### API 返回 406
+
+FxA `account/*` API 对浏览器/自动化 UA（Playwright、Firefox UA）的请求返回 406，且 `account/login` 必须携带浏览器会话 cookie。新版代码已自动处理（requests 默认 UA + context cookie），旧版本或手写脚本需注意。
+
+### 服务启动失败但 token 正常
+
+```bash
+sudo journalctl -u ipp-pool.service -n 100 --no-pager
+.venv/bin/python ipp_pool.py token-status
+.venv/bin/python ipp_pool.py probe --country COUNTRY_CODE
+```
+
+检查监听端口占用（默认 1090/8080/21000+/31000+）与上游连通性。
+
+## 命令速查
+
+```bash
+.venv/bin/python ipp_pool.py sync            # 只同步公开节点列表
+.venv/bin/python ipp_pool.py how-to-token    # token 获取指南
+.venv/bin/python ipp_pool.py token-status    # 检查 token/续期状态
+.venv/bin/python ipp_pool.py usage           # 查询 Guardian 配额
+.venv/bin/python ipp_pool.py token-refresh   # 手动刷新
+.venv/bin/python ipp_pool.py probe --country COUNTRY_CODE  # 探测指定出口
+.venv/bin/python ipp_pool.py run             # 启动代理池
+```
+
+## 自动续期机制
+
+服务每 30 秒检查一次 ProxyPass，到期前 120 秒更新。刷新时用 FxA session 获取临时 OAuth token，再从 Guardian 获取新 ProxyPass；临时 token 不落盘，用完后尝试销毁。
+
+网络错误和服务端限流按响应退避，尚未过期的 ProxyPass 在退避期间继续可用。刷新状态保存在 `tokens/refresh_state.json`，服务重启后仍遵守冷却时间。systemd 负责开机启动与进程恢复，无需 cron。
 
 ## 安全注意事项
 
-如果发现项目漏洞，请按 [`SECURITY.md`](SECURITY.md) 私下报告；不要在公开 issue 中张贴漏洞细节或真实凭据。
+漏洞请按 [`SECURITY.md`](SECURITY.md) 私下报告，不要在公开 issue 张贴漏洞细节或真实凭据。
 
 - 只操作属于自己且有权使用的账号、token 和出口。
 - 把 `fxa-renewal-credentials.json` 当作登录凭据，导入成功后删除传输副本。
 - 把 FxA session token、ProxyPass JWT、Cookie、HAR、浏览器 storage 和监听密码视为高价值凭据。
 - 不要提交 `tokens/`、运行时 `data/`、认证导出、日志、截图或浏览器配置文件。
 - 非回环监听必须启用认证，并配合防火墙限制来源。
-- Guardian 可能返回配额耗尽或限流；程序会尊重服务端响应，不能绕过配额。
-- 当前实现只提供 TCP CONNECT 兼容性，不等同于完整 VPN，也不支持 UDP/MASQUE 数据面。
-- JWT 当前未做签名密码学验证；不应把本地结构校验理解为对 token 来源的完整信任证明。
-- 节点列表目前依赖 HTTPS、schema、ETag 和 last-known-good；尚未实现 Firefox Remote Settings 使用的 Kinto canonical records、P-384 内容签名与 Mozilla PKI 证书链验证。metadata 中出现签名字段不等于本项目已经完成签名验证。
+- Guardian 可能返回配额耗尽或限流；程序尊重服务端响应，不能绕过配额。
+- 当前实现只提供 TCP CONNECT 兼容性，不等同于完整 VPN，不支持 UDP/MASQUE 数据面。
+- JWT 未做签名密码学验证；本地结构校验不等于对 token 来源的完整信任证明。
+- 节点列表依赖 HTTPS、schema、ETag 与 last-known-good；尚未实现 Kinto canonical records、P-384 内容签名与 Mozilla PKI 证书链验证。
 
 ## 开发与测试
 
@@ -460,6 +430,6 @@ git diff --check
 
 GitHub Actions 在 Python 3.10 和 3.12 上运行测试与语法检查。
 
-## 许可证与声明
+## 许可证
 
-本项目采用 MIT 许可证。它是独立的开源工具，与 Mozilla、Firefox 或 Fastly 没有官方隶属关系。
+MIT。本项目是独立开源工具，与 Mozilla、Firefox 或 Fastly 没有官方隶属关系。
