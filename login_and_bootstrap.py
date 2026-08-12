@@ -180,8 +180,12 @@ def vision_captcha(img: bytes) -> str:
             except FileNotFoundError:
                 pass
     b64 = base64.b64encode(img).decode()
+    # OpenAI-compatible 视觉模型调用：/v1/chat/completions + image_url
+    # 数据 URL。BASE_URL 兼容带或不带 /v1 前缀的两种网关写法。
+    base = api_base.rstrip("/")
+    endpoint = base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"
     r = requests.post(
-        f"{api_base}/v1/chat/completions",
+        endpoint,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": model,
@@ -205,8 +209,13 @@ def vision_captcha(img: bytes) -> str:
         },
         timeout=60,
     )
-    r.raise_for_status()
-    text = r.json()["choices"][0]["message"]["content"]
+    if r.status_code != 200:
+        detail = (r.text or "")[:200]
+        raise RuntimeError(f"vision API returned HTTP {r.status_code}: {detail}")
+    try:
+        text = r.json()["choices"][0]["message"]["content"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"vision API returned an unexpected response: {r.text[:200]}") from exc
     return re.sub(r"[^A-Za-z0-9]", "", text.strip())
 
 
