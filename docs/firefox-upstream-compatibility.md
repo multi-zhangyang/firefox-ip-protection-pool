@@ -68,9 +68,10 @@ Firefox 的 token、usage、status 和 activate 请求都发送 `Content-Type: a
 - 图形 CAPTCHA 每轮最多下发 8 题；答案错误或无法识别时 Fastly 会持续下发新题，
   8 轮耗尽后即使未放行，脚本也会继续执行登录步骤，但登录表单可能不会渲染。
 - tesseract / 传统 OCR 对这类带干扰线的 CAPTCHA 识别率极低，实测多题全错。
-- 可靠方案：配置视觉模型 API，脚本会把题图交给模型识别。环境变量：
-  `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_MODEL`
-  （OpenAI 兼容 `/v1/chat/completions`，消息含 `image_url` 数据）。
+- 可靠方案：配置视觉模型 API，脚本会把题图交给模型识别。环境变量
+  （供应商无关命名，兼容任何 OpenAI 格式 `/v1/chat/completions` 网关；
+  `ANTHROPIC_*` / `OPENAI_*` 仍作为回退支持）：
+  `VISION_API_BASE_URL`、`VISION_API_KEY`、`VISION_MODEL`。
 - Fastly 对 headless 浏览器指纹更严格；`FXA_HEADLESS=0` 配合
   `xvfb-run -a` 改用 headed 模式可显著提升通过率。
 

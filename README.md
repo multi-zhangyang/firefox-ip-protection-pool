@@ -55,10 +55,11 @@ Firefox Account/OAuth -> Guardian(vpn.mozilla.org) -> 短时 ProxyPass JWT
 .venv/bin/python -m pip install -r requirements-bootstrap.txt
 .venv/bin/playwright install firefox
 
-# Fastly 会下发图形验证码，推荐配置视觉模型 API 自动答题：
-export ANTHROPIC_BASE_URL=https://你的网关
-export ANTHROPIC_AUTH_TOKEN=你的key
-export ANTHROPIC_MODEL=视觉模型名
+# Fastly 会下发图形验证码，推荐配置视觉模型 API 自动答题
+# （任何兼容 OpenAI /v1/chat/completions 的视觉模型网关均可）：
+export VISION_API_BASE_URL=https://你的网关
+export VISION_API_KEY=你的key
+export VISION_MODEL=视觉模型名
 
 .venv/bin/python login_and_bootstrap.py --email YOUR_EMAIL
 # 或 headed 模式（通过率更高）：
@@ -138,7 +139,7 @@ import_credentials.py <bundle.json> [--delete-source]
 | 现象 | 原因与处理 |
 | --- | --- |
 | 日志反复 `reauth_required`，服务重启失败 | FxA 会话被 Mozilla 服务端撤销（实测约 10 天一次）。重新导出凭据导入，或跑 `login_and_bootstrap.py` 重新认证 |
-| 引导卡在 CAPTCHA 循环 | 未配置视觉 API 或 OCR 答错。设置 `ANTHROPIC_*` 环境变量；改用 `FXA_HEADLESS=0 xvfb-run` |
+| 引导卡在 CAPTCHA 循环 | 未配置视觉 API 或 OCR 答错。设置 `VISION_API_BASE_URL` / `VISION_API_KEY` / `VISION_MODEL`；改用 `FXA_HEADLESS=0 xvfb-run` |
 | FxA API 返回 406 | 浏览器/自动化 UA 被拒，且 `account/login` 需带会话 cookie。新版代码已处理；手写脚本注意 requests 默认 UA + cookie |
 | 代理连不通 | `token-status` 查 token；`probe --country XX` 测出口；检查端口占用与上游连通 |
 

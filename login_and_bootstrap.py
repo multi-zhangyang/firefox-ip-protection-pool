@@ -132,13 +132,26 @@ def solve_pow(base: str, target: str) -> str:
 
 
 def vision_captcha(img: bytes) -> str:
+    # 视觉模型 API 用供应商无关的 VISION_* 变量配置，兼容任何
+    # OpenAI 格式的 /v1/chat/completions 网关；历史 ANTHROPIC_*/OPENAI_*
+    # 命名保留为回退，避免破坏已有部署。
     api_base = (
-        os.environ.get("ANTHROPIC_BASE_URL")
+        os.environ.get("VISION_API_BASE_URL")
+        or os.environ.get("ANTHROPIC_BASE_URL")
         or os.environ.get("OPENAI_BASE_URL")
         or ""
     ).rstrip("/")
-    api_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("OPENAI_API_KEY")
-    model = os.environ.get("ANTHROPIC_MODEL") or os.environ.get("OPENAI_MODEL") or "grok-4.5"
+    api_key = (
+        os.environ.get("VISION_API_KEY")
+        or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    model = (
+        os.environ.get("VISION_MODEL")
+        or os.environ.get("ANTHROPIC_MODEL")
+        or os.environ.get("OPENAI_MODEL")
+        or "gpt-4o-mini"
+    )
     if not api_base or not api_key:
         fd, image_name = tempfile.mkstemp(
             prefix=".bootstrap-captcha-",
