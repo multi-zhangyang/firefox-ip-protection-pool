@@ -196,7 +196,7 @@ refresh_state.result: success
 
 网络错误和服务端限流会按响应信息退避，尚未过期的 ProxyPass 在此期间仍可继续使用。刷新状态保存在 `tokens/refresh_state.json`，服务重启后仍会遵守冷却时间。systemd 负责开机启动和进程恢复，不需要额外配置 cron。
 
-FxA session 被撤销后不能继续续期。出现 `reauth_required` 时，请在桌面 Firefox 中重新登录和验证，重新导出凭据并在 VPS 上再次导入。
+FxA session 被撤销后不能继续续期。出现 `reauth_required` 时，请在桌面 Firefox 中重新登录和验证，重新导出凭据并在 VPS 上再次导入；也可以在本机直接运行上面的 `login_and_bootstrap.py` 命令行引导完成重新认证。实测 Mozilla 会周期性撤销长期自动续期会话（约 10 天一次），建议把 `tokens/refresh_state.json` 的 `result` 纳入监控。
 
 ## 默认启动：所有国家与综合随机入口
 
@@ -400,6 +400,36 @@ export/exits.json           # 同步得到的节点详情
 ## 备用登录方式
 
 `login_and_bootstrap.py` 保留为兼容性工具。桌面 Firefox 导出是 Windows/macOS 用户和无图形 VPS 的标准安装方式；命令行引导不适合作为无图形 VPS 的首次登录方案。
+
+命令行引导需要额外的运行依赖，用于通过 Fastly 挑战、登录和邮箱验证码：
+
+```bash
+.venv/bin/python -m pip install -r requirements-bootstrap.txt
+.venv/bin/playwright install firefox
+sudo apt install -y xvfb        # 仅在需要 headed 模式时
+```
+
+Fastly 会向自动化登录下发图形验证码，脚本默认尝试本地 OCR 无法稳定识别；推荐配置视觉模型 API 自动答题：
+
+```bash
+export ANTHROPIC_BASE_URL=https://your-gateway.example.com
+export ANTHROPIC_AUTH_TOKEN=your-token
+export ANTHROPIC_MODEL=your-vision-model
+```
+
+（网关必须兼容 OpenAI `/v1/chat/completions`，消息内容包含 `image_url` 数据字段。）
+
+启动方式：
+
+```bash
+# headless（默认）
+.venv/bin/python login_and_bootstrap.py --email YOUR_EMAIL
+
+# headed + xvfb，Fastly 挑战通过率更高
+FXA_HEADLESS=0 xvfb-run -a .venv/bin/python login_and_bootstrap.py --email YOUR_EMAIL
+```
+
+脚本会依次处理 Fastly challenge（POW/CAPTCHA）、密码、图形验证码（如出现）和邮箱 6 位验证码。已知上游行为与复刻要点见 [`docs/firefox-upstream-compatibility.md`](docs/firefox-upstream-compatibility.md) 的“认证链路观察”一节。
 
 ## Firefox 兼容性
 

@@ -3,6 +3,8 @@ tokens/*
 !tokens/.gitkeep
 !tokens/*.example.txt
 !tokens/*.example.json
+tokens.bak*/
+tokens-backup*/
 data/*
 !data/.gitkeep
 export/*

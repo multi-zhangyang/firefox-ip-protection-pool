@@ -1,6 +1,6 @@
 # Firefox IP Protection 上游兼容性记录
 
-更新时间：2026-07-28
+更新时间：2026-08-12
 
 这份记录说明本地代理池如何对齐 Firefox 桌面端 IP Protection 的现行行为。它只记录公开协议和代码结构，不包含账号、会话、代理口令或运行时地址。
 
@@ -57,6 +57,40 @@ Firefox 的 token、usage、status 和 activate 请求都发送 `Content-Type: a
 | `X-Quota-Unlimited: true` 或有限配额三元组 | unlimited 不要求有限字段；否则严格校验 limit/remaining/reset、非负值和时间区 | 坏 quota 不会静默伪装成有效数值，也不会阻止有效 ProxyPass 使用 |
 | Guardian 返回 429/5xx 或 `Retry-After` | 有界重试、尊重有限等待、保留最后有效 token | 避免刷新风暴和凭据回退为空 |
 | 代理 JWT 字段异常或即将过期 | 校验三段结构、必要 claims、issuer/audience、时间关系 | 坏 token 不覆盖 last-good；不输出 token 内容 |
+
+## 认证链路观察（2026-08-12）
+
+以下为 `login_and_bootstrap.py` 重新认证时实测到的上游行为，供复刻者参考：
+
+### Fastly 挑战循环与图形验证码
+
+- 访问 `accounts.firefox.com` 会先经过 Fastly challenge（POW 与/或图形 CAPTCHA）。
+- 图形 CAPTCHA 每轮最多下发 8 题；答案错误或无法识别时 Fastly 会持续下发新题，
+  8 轮耗尽后即使未放行，脚本也会继续执行登录步骤，但登录表单可能不会渲染。
+- tesseract / 传统 OCR 对这类带干扰线的 CAPTCHA 识别率极低，实测多题全错。
+- 可靠方案：配置视觉模型 API，脚本会把题图交给模型识别。环境变量：
+  `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_MODEL`
+  （OpenAI 兼容 `/v1/chat/completions`，消息含 `image_url` 数据）。
+- Fastly 对 headless 浏览器指纹更严格；`FXA_HEADLESS=0` 配合
+  `xvfb-run -a` 改用 headed 模式可显著提升通过率。
+
+### FxA API 的 406 反自动化
+
+- `POST /v1/account/credentials/status`：带浏览器/自动化 UA（Playwright、Firefox UA）
+  的请求会被 Fastly 边缘层以 406 拒绝；requests 默认 UA 放行。
+- `POST /v1/account/login`：即使使用 requests 默认 UA 也返回 406（空 body，
+  走 Fastly 边缘层），必须携带浏览器会话 cookie（Fastly CAPTCHA 通过的凭证）才放行。
+- 结论：`account/*` API 调用应使用 requests 默认 UA + 从 Playwright context
+  复制的 cookie，二者缺一不可（见 `login_and_bootstrap.py::api_login_with_page`）。
+
+### FxA 会话生命周期
+
+- Guardian 每 10 分钟签发一次 ProxyPass，长期无人值守自动续期可用。
+- FxA session 会被 Mozilla 服务端周期性撤销（实测约 10 天一次），下次续期返回
+  HTTP 401 `reauth_required`，必须重新交互式登录（邮箱 6 位验证码）或重新导入
+  桌面 Firefox 凭据；无法通过纯 API 恢复。
+- 运维上应监控 `tokens/refresh_state.json` 的 `result`，连续出现
+  `reauth_required` 时提前安排重新认证，避免代理池空转。
 
 ## 本地转发边界
 

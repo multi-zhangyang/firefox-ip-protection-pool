@@ -305,14 +305,26 @@ def submit_email_code(page, code: str) -> None:
 
 
 def api_login_with_page(page, email: str, password: str) -> dict:
-    cr = page.request.post(
+    # FxA API 反自动化：带浏览器/自动化 UA（如 Playwright 或 Firefox UA）的
+    # account/* 请求会被 Fastly 边缘层以 406 拒绝；requests 默认 UA 可放行。
+    # credentials/status 是低风险查询（无 UA 限制），但 account/login 要求
+    # 请求携带浏览器会话 cookie（Fastly CAPTCHA 通过的凭证），因此从
+    # Playwright context 复制 cookie 再走 requests，两者缺一不可。
+    cookie_jar = {c["name"]: c["value"] for c in page.context.cookies()}
+    hdrs = {
+        "content-type": "application/json",
+        "accept": "application/json",
+    }
+    cr = requests.post(
         "https://api.accounts.firefox.com/v1/account/credentials/status",
         data=json.dumps({"email": email}),
-        headers={"content-type": "application/json", "accept": "application/json"},
+        headers=hdrs,
+        cookies=cookie_jar,
+        timeout=30,
     )
-    print("[*] credentials/status", cr.status)
+    print("[*] credentials/status", cr.status_code)
     salt = None
-    if cr.status == 200:
+    if cr.status_code == 200:
         try:
             status_data = cr.json()
         except Exception as exc:
@@ -321,20 +333,21 @@ def api_login_with_page(page, email: str, password: str) -> dict:
     if not salt:
         raise RuntimeError("credentials/status did not return a clientSalt; refusing stale fallback")
     sp = StretchedPassword(2, email, salt, password, None)
-    lr = page.request.post(
+    lr = requests.post(
         "https://api.accounts.firefox.com/v1/account/login",
         data=json.dumps({"email": email, "authPW": sp.get_auth_pw_v2(), "reason": "login"}),
         headers={
-            "content-type": "application/json",
-            "accept": "application/json",
+            **hdrs,
             "origin": "https://accounts.firefox.com",
             "referer": "https://accounts.firefox.com/",
         },
+        cookies=cookie_jar,
+        timeout=30,
     )
-    print("[*] account/login", lr.status)
-    if lr.status != 200:
+    print("[*] account/login", lr.status_code)
+    if lr.status_code != 200:
         # maybe already logged in via UI and session cookies exist; still need sessionToken
-        raise RuntimeError(f"account/login failed: HTTP {lr.status}")
+        raise RuntimeError(f"account/login failed: HTTP {lr.status_code}")
     data = lr.json()
     if not isinstance(data, dict):
         raise RuntimeError("account/login returned an invalid response")
@@ -561,7 +574,11 @@ def main() -> int:
 
     with sync_playwright() as p:
         # This intentionally launches Playwright Firefox, not Chromium.
-        browser = p.firefox.launch(headless=True)
+        # Fastly 对 headless 浏览器指纹更严格；`FXA_HEADLESS=0` 配合
+        # xvfb-run（如 `FXA_HEADLESS=0 xvfb-run -a python login_and_bootstrap.py`）
+        # 可改用 headed 模式提升 CAPTCHA 通过率。
+        headless = os.environ.get("FXA_HEADLESS", "1") != "0"
+        browser = p.firefox.launch(headless=headless)
         try:
             context = browser.new_context(viewport={"width": 1280, "height": 900}, locale="en-US")
             page = context.new_page()
