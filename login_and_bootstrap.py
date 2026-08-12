@@ -132,26 +132,12 @@ def solve_pow(base: str, target: str) -> str:
 
 
 def vision_captcha(img: bytes) -> str:
-    # 视觉模型 API 用供应商无关的 VISION_* 变量配置，兼容任何
-    # OpenAI 格式的 /v1/chat/completions 网关；历史 ANTHROPIC_*/OPENAI_*
-    # 命名保留为回退，避免破坏已有部署。
-    api_base = (
-        os.environ.get("VISION_API_BASE_URL")
-        or os.environ.get("ANTHROPIC_BASE_URL")
-        or os.environ.get("OPENAI_BASE_URL")
-        or ""
-    ).rstrip("/")
-    api_key = (
-        os.environ.get("VISION_API_KEY")
-        or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-        or os.environ.get("OPENAI_API_KEY")
-    )
-    model = (
-        os.environ.get("VISION_MODEL")
-        or os.environ.get("ANTHROPIC_MODEL")
-        or os.environ.get("OPENAI_MODEL")
-        or "gpt-4o-mini"
-    )
+    # 视觉模型 API 配置与供应商无关：VISION_API_BASE_URL / VISION_API_KEY /
+    # VISION_MODEL。任何提供标准 /v1/chat/completions 接口（消息内容含
+    # image_url）的视觉模型网关均可接入。未配置时退回本地交互识别。
+    api_base = os.environ.get("VISION_API_BASE_URL", "").rstrip("/")
+    api_key = os.environ.get("VISION_API_KEY")
+    model = os.environ.get("VISION_MODEL")
     if not api_base or not api_key:
         fd, image_name = tempfile.mkstemp(
             prefix=".bootstrap-captcha-",
@@ -179,8 +165,10 @@ def vision_captcha(img: bytes) -> str:
                 image_path.unlink()
             except FileNotFoundError:
                 pass
+    if not model:
+        raise RuntimeError("VISION_MODEL is required when using a vision API")
     b64 = base64.b64encode(img).decode()
-    # OpenAI-compatible 视觉模型调用：/v1/chat/completions + image_url
+    # 标准 chat/completions 视觉调用：/v1/chat/completions + image_url
     # 数据 URL。BASE_URL 兼容带或不带 /v1 前缀的两种网关写法。
     base = api_base.rstrip("/")
     endpoint = base + "/chat/completions" if base.endswith("/v1") else base + "/v1/chat/completions"

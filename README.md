@@ -56,7 +56,7 @@ Firefox Account/OAuth -> Guardian(vpn.mozilla.org) -> 短时 ProxyPass JWT
 .venv/bin/playwright install firefox
 
 # Fastly 会下发图形验证码，推荐配置视觉模型 API 自动答题
-# （任何兼容 OpenAI /v1/chat/completions 的视觉模型网关均可）：
+# （任何提供标准 /v1/chat/completions 视觉接口的模型网关均可）：
 export VISION_API_BASE_URL=https://你的网关
 export VISION_API_KEY=你的key
 export VISION_MODEL=视觉模型名
