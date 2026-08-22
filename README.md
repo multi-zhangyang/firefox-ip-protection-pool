@@ -159,5 +159,7 @@ import_credentials.py <bundle.json> [--delete-source]
 bash -n run_service.sh start_pool.sh
 git diff --check
 ```
+## 友链
+- [Linux.Do](https://linux.do)
 
 MIT 许可证。独立开源工具，与 Mozilla/Firefox/Fastly 无官方隶属关系。
